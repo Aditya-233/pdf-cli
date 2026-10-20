@@ -1,0 +1,36 @@
+{
+  "laptop": {
+    "dual": "half",
+    "fit": "height",
+    "crop_top": "0.04",
+    "crop_bottom": "0.04",
+    "crop_left": "0.06",
+    "crop_right": "0.06"
+  },
+  "display": {
+    "dual": "off",
+    "fit": "height",
+    "crop": "0"
+  },
+  "white": {
+    "tint": "off"
+  },
+  "pale": {
+    "tint": "dim"
+  },
+  "dark": {
+    "tint": "dark"
+  },
+  "invert": {
+    "tint": "invert"
+  },
+  "trim": {
+    "crop": "+0.02"
+  },
+  "untrim": {
+    "crop": "-0.02"
+  },
+  "notrim": {
+    "crop": "0"
+  }
+}
