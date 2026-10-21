@@ -219,12 +219,15 @@ void term_get_pixel_size(int *width_px, int *height_px) {
 }
 
 void term_enable_kitty_keyboard(void) {
-    fputs("\033[>1u", stdout);
+    // Enable Kitty progressive keyboard protocol (flag 1: disambiguate escape codes)
+    // and xterm modifyOtherKeys (mode 2)
+    fputs("\033[>1u\033[>4;2m", stdout);
     fflush(stdout);
 }
 
 void term_disable_kitty_keyboard(void) {
-    fputs("\033[<u", stdout);
+    // Disable Kitty keyboard protocol and xterm modifyOtherKeys
+    fputs("\033[<u\033[>4;0m", stdout);
     fflush(stdout);
 }
 
@@ -320,7 +323,15 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
         if (poll(&pfd, 1, 50) <= 0) return set_key(buf, max_len, 27);
         unsigned char b2 = 0;
-        if (read(fd, &b2, 1) <= 0 || (b2 != '[' && b2 != 'O')) return set_key(buf, max_len, 27);
+        if (read(fd, &b2, 1) <= 0) return set_key(buf, max_len, 27);
+        if (b2 >= '1' && b2 <= '9') {
+            // Alt+1 .. Alt+9 fallback
+            return set_key(buf, max_len, KEY_CTRL_1 + (b2 - '1'));
+        }
+        if (b2 == '0') {
+            return set_key(buf, max_len, KEY_CTRL_0);
+        }
+        if (b2 != '[' && b2 != 'O') return set_key(buf, max_len, 27);
         if (b2 == 'O') {
             unsigned char fn = 0;
             if (read(fd, &fn, 1) <= 0) return 27;
@@ -362,10 +373,27 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
         case 'D': return set_key(buf, max_len, super ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
         case 'V': return set_key(buf, max_len, KEY_PAGE_UP);
         case 'U': return set_key(buf, max_len, KEY_PAGE_DOWN);
+        case 'Z': return set_key(buf, max_len, KEY_CTRL_SHIFT_TAB); // Shift+Tab (backtab)
         case '~': {
-            int code = atoi(params);
-            if (code == 5) return set_key(buf, max_len, KEY_PAGE_UP);
-            if (code == 6) return set_key(buf, max_len, KEY_PAGE_DOWN);
+            int p1 = 0, p2 = 0, p3 = 0;
+            int n = sscanf(params, "%d;%d;%d", &p1, &p2, &p3);
+            if (n == 3 && p1 == 27) {
+                // XTerm modifyOtherKeys: \033[27;<mods>;<kcode>~
+                int mods = p2 - 1;
+                int kcode = p3;
+                bool ctrl = (mods & 4) != 0;
+                bool s_held = (mods & 1) != 0;
+                if (ctrl) {
+                    if (kcode >= '1' && kcode <= '9') return set_key(buf, max_len, KEY_CTRL_1 + (kcode - '1'));
+                    if (kcode == '0') return set_key(buf, max_len, KEY_CTRL_0);
+                    if (kcode == '\t' || kcode == 9) return set_key(buf, max_len, s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
+                    if (kcode == 'w' || kcode == 'W') return set_key(buf, max_len, KEY_CTRL_W);
+                    if (kcode == 't' || kcode == 'T') return set_key(buf, max_len, KEY_CTRL_T);
+                }
+            } else if (n >= 1) {
+                if (p1 == 5) return set_key(buf, max_len, KEY_PAGE_UP);
+                if (p1 == 6) return set_key(buf, max_len, KEY_PAGE_DOWN);
+            }
             return 0;
         }
         case 'u': {
@@ -381,7 +409,12 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
             if (key == 57350) return set_key(buf, max_len, sup_held ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
             if (key == 57351) return set_key(buf, max_len, sup_held ? KEY_HISTORY_FORWARD : KEY_ARROW_RIGHT);
             if (raw_mods > 0) {
-                if ((mod_bits & (1 | 2 | 4 | 8)) == 4) {
+                if ((mod_bits & 4) != 0) {
+                    if (key >= '1' && key <= '9') return set_key(buf, max_len, KEY_CTRL_1 + (key - '1'));
+                    if (key == '0') return set_key(buf, max_len, KEY_CTRL_0);
+                    if (key == '\t' || key == 9) return set_key(buf, max_len, s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
+                    if (key == 'w' || key == 'W') return set_key(buf, max_len, KEY_CTRL_W);
+                    if (key == 't' || key == 'T') return set_key(buf, max_len, KEY_CTRL_T);
                     if (key == 'i') return set_key(buf, max_len, KEY_HISTORY_BACK);
                     if (key == 'o') return set_key(buf, max_len, KEY_HISTORY_FORWARD);
                     if (key == 'c') return set_key(buf, max_len, 3);

@@ -247,6 +247,35 @@ static void test_term_input(void) {
     test_key_parse("\033[<64;15;25M", KEY_MOUSE_WHEEL_UP);
     test_key_parse("\033[<65;15;25M", KEY_MOUSE_WHEEL_DOWN);
 
+    // Kitty Keyboard Protocol (CSI u) Tab shortcuts
+    test_key_parse("\033[49;5u", KEY_CTRL_1);
+    test_key_parse("\033[50;5u", KEY_CTRL_2);
+    test_key_parse("\033[57;5u", KEY_CTRL_9);
+    test_key_parse("\033[48;5u", KEY_CTRL_0);
+    test_key_parse("\033[9;5u", KEY_CTRL_TAB);
+    test_key_parse("\033[9;6u", KEY_CTRL_SHIFT_TAB);
+    test_key_parse("\033[119;5u", KEY_CTRL_W);
+    test_key_parse("\033[116;5u", KEY_CTRL_T);
+
+    // XTerm modifyOtherKeys (Mode 2) Tab shortcuts
+    test_key_parse("\033[27;5;49~", KEY_CTRL_1);
+    test_key_parse("\033[27;5;50~", KEY_CTRL_2);
+    test_key_parse("\033[27;5;57~", KEY_CTRL_9);
+    test_key_parse("\033[27;5;48~", KEY_CTRL_0);
+    test_key_parse("\033[27;5;9~", KEY_CTRL_TAB);
+    test_key_parse("\033[27;6;9~", KEY_CTRL_SHIFT_TAB);
+    test_key_parse("\033[27;5;119~", KEY_CTRL_W);
+    test_key_parse("\033[27;5;116~", KEY_CTRL_T);
+
+    // Standard Shift+Tab (backtab)
+    test_key_parse("\033[Z", KEY_CTRL_SHIFT_TAB);
+
+    // Alt+1 .. Alt+9, Alt+0 universal fallbacks
+    test_key_parse("\0331", KEY_CTRL_1);
+    test_key_parse("\0332", KEY_CTRL_2);
+    test_key_parse("\0339", KEY_CTRL_9);
+    test_key_parse("\0330", KEY_CTRL_0);
+
     printf("  Terminal input & key parsing tests passed!\n");
 }
 

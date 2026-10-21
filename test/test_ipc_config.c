@@ -80,6 +80,8 @@ static void test_ctl_proto(void) {
         .search_index = 3,
         .reflowable = false,
         .is_image = false,
+        .tab_count = 3,
+        .active_tab = 2,
         .agterm_session = "sess-99",
         .socket = "/tmp/4242.sock"
     };
@@ -98,6 +100,8 @@ static void test_ctl_proto(void) {
     assert(strcmp(parsed_st.half, "bottom") == 0);
     assert(parsed_st.zoom > 1.24 && parsed_st.zoom < 1.26);
     assert(parsed_st.search_hits == 12);
+    assert(parsed_st.tab_count == 3);
+    assert(parsed_st.active_tab == 2);
     free(state_json);
 
     // 2. TOC serialization & parsing

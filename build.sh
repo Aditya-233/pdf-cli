@@ -71,6 +71,14 @@ do_test() {
         src/config.c src/ctl_proto.c src/ctl_server.c src/ctl_client.c \
         depends/yyjson/src/yyjson.c -o "$BUILD_DIR/test/test_ipc"
     "$BUILD_DIR/test/test_ipc"
+
+    $CC $CFLAGS $INCLUDES test/test_tabs.c \
+        src/viewer.c src/doc_engine.c src/img_util.c src/term_raw.c \
+        src/term_gfx.c src/utf8_util.c src/fuzzy_match.c src/file_search.c \
+        src/picker.c src/menu.c src/toc_modal.c src/config.c src/ctl_proto.c \
+        src/ctl_server.c src/cache.c src/file_watcher.c src/arena.c \
+        depends/yyjson/src/yyjson.c $LIBS -o "$BUILD_DIR/test/test_tabs"
+    "$BUILD_DIR/test/test_tabs"
     echo "===> All tests passed!"
 }
 

@@ -26,6 +26,8 @@ typedef struct ctl_viewer_state {
     int search_index;
     bool reflowable;
     bool is_image;
+    int tab_count;
+    int active_tab;
     char agterm_session[64];
     char socket[1024];
 } ctl_viewer_state;

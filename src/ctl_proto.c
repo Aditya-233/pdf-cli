@@ -48,6 +48,8 @@ void ctl_get_socket_path(int pid, char *out, size_t sz) {
         yyjson_mut_obj_add_int(doc, s, "search_index", st->search_index);
         yyjson_mut_obj_add_bool(doc, s, "reflowable", st->reflowable);
         yyjson_mut_obj_add_bool(doc, s, "is_image", st->is_image);
+        yyjson_mut_obj_add_int(doc, s, "tab_count", st->tab_count);
+        yyjson_mut_obj_add_int(doc, s, "active_tab", st->active_tab);
         if (st->agterm_session[0]) yyjson_mut_obj_add_str(doc, s, "agterm_session", st->agterm_session);
         yyjson_mut_obj_add_str(doc, s, "socket", st->socket);
         yyjson_mut_obj_add_val(doc, root, "state", s);
@@ -137,6 +139,8 @@ void ctl_get_socket_path(int pid, char *out, size_t sz) {
     st->search_index = yyjson_get_int(yyjson_obj_get(s, "search_index"));
     st->reflowable = yyjson_get_bool(yyjson_obj_get(s, "reflowable"));
     st->is_image = yyjson_get_bool(yyjson_obj_get(s, "is_image"));
+    st->tab_count = yyjson_get_int(yyjson_obj_get(s, "tab_count"));
+    st->active_tab = yyjson_get_int(yyjson_obj_get(s, "active_tab"));
     if ((v = yyjson_get_str(yyjson_obj_get(s, "agterm_session")))) snprintf(st->agterm_session, sizeof(st->agterm_session), "%s", v);
     if ((v = yyjson_get_str(yyjson_obj_get(s, "socket")))) snprintf(st->socket, sizeof(st->socket), "%s", v);
     yyjson_doc_free(doc);

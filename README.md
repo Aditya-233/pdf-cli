@@ -13,6 +13,7 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 
 ## Features
 
+- **Multi-Document Tab Support**: Open up to 10 documents concurrently with tab bar on row 1, seamless `Ctrl+1`..`Ctrl+9` switching, and mouse click / wheel navigation
 - **Fuzzy File Search**: Interactive file picker with fuzzy search to quickly find your PDFs and EPUBs
 - **Smart Content Detection**: Automatically detects and displays text, images, or mixed content pages
 - **High-Resolution Image Rendering**: Uses terminal graphics protocols (Sixel/Kitty/iTerm2) for crisp image display
@@ -25,35 +26,48 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 - **Manual Zoom**: Adjust zoom from 10% to 200%
 - **In-Document Search**: Search for text within documents
 - **Navigation Tools**: Follow document links, browse jump history, and fuzzy-search the table of contents
-- **Viewer Control**: Inspect and control running viewers with `dvctl` or `pdf-cli ctl`
+- **Viewer Control & IPC**: Inspect and control running viewers with `dvctl` or `pdf-cli ctl`, including remote tab switching and opening
 - **Intelligent Text Reflow**: Automatically reformats text to fit your terminal width while preserving paragraphs
 - **Terminal-Aware**: Detects your terminal type and optimizes rendering accordingly
 - **Multiple Formats**: Supports PDF, EPUB, DOCX, HTML, PNG, and JPEG files
 
-## Keyboard Shortcuts
+## Keyboard & Mouse Shortcuts
+
+### Tab Navigation
+
+| Key / Mouse Action | Action |
+|--------------------|--------|
+| `Ctrl+1` .. `Ctrl+9` | Switch directly to tab 1 through 9 (or `Alt+1` .. `Alt+9` fallback) |
+| `Ctrl+0` | Switch to tab 10 / last active tab (or `Alt+0` fallback) |
+| `Ctrl+Tab` / `gt` | Cycle to next tab |
+| `Ctrl+Shift+Tab` / `gT` | Cycle to previous tab |
+| `Ctrl+T` | Open file picker to launch a document in a new tab |
+| `Ctrl+W` | Close active tab (exits if last tab) |
+| `Mouse Left` on Tab Label | Switch to clicked tab |
+| `Mouse Left` on Tab `×` | Close clicked tab |
+| `Mouse Wheel` on Tab Bar | Cycle forward/backward through tabs |
+
+### Document & Page Navigation
 
 | Key | Action |
 |-----|--------|
-| `j` / `Space` / `Down` / `Right` | Next page |
-| `k` / `Up` / `Left` | Previous page |
-| `g` | Go to specific page |
+| `j` / `Space` / `Down` / `Right` | Next page / smooth scroll down (fit-width) |
+| `k` / `Up` / `Left` | Previous page / smooth scroll up (fit-width) |
+| `PgDn` / `PgUp` | Smooth page-height continuous scrolling |
+| `[` / `]` | Decrease / increase scroll ratio (10% to 80%) |
+| `g` | Go to specific page (or type `gt`/`gT` for tabs) |
 | `T` | Table of contents overlay (fuzzy search, Enter jumps) |
-| `Ctrl+Click` | Follow links, references, citations, and URLs |
+| `Ctrl+Click` / `Left Click` | Follow links, references, citations, and URLs |
 | `Cmd+Left` / `Cmd+Right` | Move backward or forward through jump history |
 | `b` | Back to file picker |
-| `/` | Search in document |
-| `n` | Next search result |
-| `N` | Previous search result |
-| `t` | Toggle text/image/auto mode |
-| `f` | Cycle fit modes (height/width/auto) |
-| `D` | Cycle page tint (white/gray/dark/invert) |
-| `+` / `=` | Zoom in |
-| `-` | Zoom out |
+| `f` | Toggle fit mode (Fit width continuous scroll vs. Fit height) |
+| `D` | Cycle page tint (white / dim / dark / invert) |
+| `+` / `=` | Zoom in (+10%) |
+| `-` | Zoom out (-10%) |
+| `i` | Show document status info toast |
 | `r` | Refresh display (re-detect cell size) |
-| `d` | Show debug info |
-| `h` | Show help |
-| `q` | Quit |
-| `2` | Cycle page modes |
+| `h` | Show help modal |
+| `q` | Quit viewer |
 
 ## Installation
 
@@ -112,8 +126,19 @@ pdf-cli ~/Documents/papers/
 # Open a specific file directly
 pdf-cli paper.pdf
 
+# Open multiple documents in tabs
+pdf-cli doc1.pdf doc2.pdf doc3.pdf
+
 # Inspect a running viewer
 pdf-cli ctl status
+
+# Control tabs via dvctl / IPC
+dvctl tab list
+dvctl tab next
+dvctl tab prev
+dvctl tab switch 2
+dvctl tab open reference.pdf
+dvctl tab close
 ```
 
 ## LaTeX Workflow

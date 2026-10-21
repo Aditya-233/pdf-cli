@@ -233,6 +233,12 @@ int ctl_client_main(int argc, char **argv) {
                 yyjson_mut_obj_add_str(rdoc, args, key, val);
             } else if (strcmp(cmd, "page") == 0) {
                 yyjson_mut_obj_add_str(rdoc, args, "to", argv[i]);
+            } else if (strcmp(cmd, "tab") == 0) {
+                if (i == cmd_idx + 1) {
+                    yyjson_mut_obj_add_str(rdoc, args, "action", argv[i]);
+                } else if (i == cmd_idx + 2) {
+                    yyjson_mut_obj_add_str(rdoc, args, "param", argv[i]);
+                }
             }
         }
         yyjson_mut_obj_add_val(rdoc, rroot, "args", args);

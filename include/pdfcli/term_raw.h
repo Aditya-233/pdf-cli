@@ -29,7 +29,21 @@ enum term_key : int {
     KEY_ARROW_LEFT       = 0xF0, // Left Arrow
     KEY_ARROW_RIGHT      = 0xF1, // Right Arrow
     KEY_ARROW_PREV       = KEY_ARROW_LEFT,
-    KEY_ARROW_NEXT       = KEY_ARROW_RIGHT
+    KEY_ARROW_NEXT       = KEY_ARROW_RIGHT,
+    KEY_CTRL_W           = 0x17, // Ctrl+W (standard ASCII 23)
+    KEY_CTRL_T           = 0x14, // Ctrl+T (standard ASCII 20)
+    KEY_CTRL_1           = 0x101, // Ctrl+1 (Tab 1)
+    KEY_CTRL_2           = 0x102, // Ctrl+2 (Tab 2)
+    KEY_CTRL_3           = 0x103, // Ctrl+3 (Tab 3)
+    KEY_CTRL_4           = 0x104, // Ctrl+4 (Tab 4)
+    KEY_CTRL_5           = 0x105, // Ctrl+5 (Tab 5)
+    KEY_CTRL_6           = 0x106, // Ctrl+6 (Tab 6)
+    KEY_CTRL_7           = 0x107, // Ctrl+7 (Tab 7)
+    KEY_CTRL_8           = 0x108, // Ctrl+8 (Tab 8)
+    KEY_CTRL_9           = 0x109, // Ctrl+9 (Tab 9)
+    KEY_CTRL_0           = 0x10A, // Ctrl+0 (Tab 10 / Last)
+    KEY_CTRL_TAB         = 0x10B, // Ctrl+Tab (Next tab)
+    KEY_CTRL_SHIFT_TAB   = 0x10C  // Ctrl+Shift+Tab (Prev tab)
 };
 
 struct term_state {

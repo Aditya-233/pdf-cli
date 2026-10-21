@@ -8,3 +8,4 @@
 // Returns a newly heap-allocated string of the selected file path (caller must free),
 // or nullptr if cancelled.
 [[nodiscard]] char *picker_run(file_list *files);
+[[nodiscard]] char *picker_run_ex(file_list *files, bool *out_new_tab);

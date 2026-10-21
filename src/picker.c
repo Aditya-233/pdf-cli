@@ -11,8 +11,9 @@
 #include <unistd.h>
 #include <ctype.h>
 
-[[nodiscard]] char *picker_run(file_list *files) {
+[[nodiscard]] char *picker_run_ex(file_list *files, bool *out_new_tab) {
     if (!files || files->count == 0) return nullptr;
+    if (out_new_tab) *out_new_tab = false;
     term_state ts;
     if (!term_enter_raw(&ts)) return nullptr;
     term_hide_cursor();
@@ -35,7 +36,7 @@
         if (sel >= scroll + win_h) scroll = sel - win_h + 1;
 
         printf("\033[H\033[2J");
-        printf("\033[1;1H\033[1;36m=== Open Document (Type to filter, Up/Down, Enter to open, Esc to cancel) ===\033[0m\r\n");
+        printf("\033[1;1H\033[1;36m=== Open Document (Type to filter, Enter: open, Ctrl+T: tab, Esc: cancel) ===\033[0m\r\n");
         printf("\033[2;1H> %s\033[K\r\n", query);
         printf("\033[3;1H\033[2m─────────────────────────────────────────────────────────────────────────────\033[0m\r\n");
 
@@ -54,8 +55,11 @@
         char buf[32] = {};
         int k = term_read_key(STDIN_FILENO, buf, sizeof(buf), nullptr, nullptr);
         if (k == 27 || k == KEY_CTRL_C) break;
-        if (k == '\r' || k == '\n') {
-            if (mcount > 0 && sel < (int)mcount) selected_path = strdup(files->entries[matches[sel]].path);
+        if (k == '\r' || k == '\n' || k == KEY_CTRL_T) {
+            if (mcount > 0 && sel < (int)mcount) {
+                selected_path = strdup(files->entries[matches[sel]].path);
+                if (out_new_tab) *out_new_tab = (k == KEY_CTRL_T);
+            }
             break;
         }
         if (k == KEY_ARROW_UP || k == 'k') { if (sel > 0) sel--; }
@@ -70,4 +74,8 @@
     term_restore(&ts);
     term_show_cursor();
     return selected_path;
+}
+
+[[nodiscard]] char *picker_run(file_list *files) {
+    return picker_run_ex(files, nullptr);
 }

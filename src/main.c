@@ -25,18 +25,27 @@
 
 static void print_help(void) {
     puts("pdf-cli (C23) - Terminal-based document viewer\n\n"
-         "USAGE: pdf-cli [OPTIONS] [PATH]  |  dvctl [OPTIONS] [COMMAND] ...\n"
-         "ARGUMENTS: [PATH] File or directory to open (fuzzy search directory or open file)\n"
+         "USAGE: pdf-cli [OPTIONS] [PATH...]  |  dvctl [OPTIONS] [COMMAND] ...\n"
+         "ARGUMENTS: [PATH...] One or more files or directory to open in tabs\n"
          "OPTIONS:\n"
          "  -h, --help     Show help\n"
          "  -v, --version  Show version\n"
          "  ctl ...        Control running viewers (see: pdf-cli ctl help)\n\n"
+         "TAB NAVIGATION:\n"
+         "  Ctrl+1 .. Ctrl+9 (Alt+1..9) Switch directly to tab 1 through 9\n"
+         "  Ctrl+0           (Alt+0)     Switch to tab 10 / last tab\n"
+         "  Ctrl+Tab / gt                Cycle to next tab\n"
+         "  Ctrl+Shift+Tab / gT          Cycle to previous tab\n"
+         "  Ctrl+T                       Open document in new tab\n"
+         "  Ctrl+W                       Close current tab\n"
+         "  Mouse Left on Tab Bar        Click tab to switch / click × to close\n"
+         "  Mouse Wheel on Tab Bar       Cycle through tabs\n\n"
          "KEYBOARD SHORTCUTS:\n"
          "  j, Down        Scroll down (line) / Next page (fit-height)\n"
          "  k, Up          Scroll up (line) / Prev page (fit-height)\n"
          "  PgDn, Space    Continuous smooth scroll down / Page down\n"
          "  PgUp           Continuous smooth scroll up / Page up\n"
-         "  g              Jump to specific page number\n"
+         "  g              Jump to specific page number (or 'gt'/'gT' for tabs)\n"
          "  f              Cycle fit modes (fit-width continuous / fit-height)\n"
          "  D              Cycle tint (white/dim/dark/invert)\n"
          "  T              Table of contents modal\n"
@@ -161,6 +170,34 @@ int main(int argc, char **argv) {
                 if (!cont) return 0;
             }
         }
+    }
+
+    if (argc > 2) {
+        char *first_exp = expand_path(argv[1]);
+        struct stat st;
+        if (stat(first_exp, &st) != 0 || S_ISDIR(st.st_mode)) {
+            printf("Path not found: %s\n", first_exp);
+            free(first_exp);
+            return 1;
+        }
+        doc_viewer *v = viewer_create(first_exp);
+        free(first_exp);
+        if (!v || !viewer_open(v)) {
+            printf("Error opening file: %s\n", argv[1]);
+            if (v) viewer_destroy(v);
+            return 1;
+        }
+        for (int i = 2; i < argc; i++) {
+            char *next_exp = expand_path(argv[i]);
+            if (next_exp) {
+                (void)viewer_add_tab(v, next_exp);
+                free(next_exp);
+            }
+        }
+        viewer_switch_tab(v, 0);
+        (void)viewer_run(v);
+        viewer_destroy(v);
+        return 0;
     }
 
     char *exp = expand_path(argv[1]);
