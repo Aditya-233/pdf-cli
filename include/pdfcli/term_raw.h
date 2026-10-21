@@ -120,6 +120,12 @@ void term_clear_title(void);
 // cell coordinates of mouse clicks.
 int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *out_mouse_row);
 
+// Logs raw keystrokes and events to /tmp/pdfcli_keystrokes.log with timestamps and hex dumps
+void term_log_keystroke(const char *fmt, ...);
+
+// Returns a human-readable display string for a key code
+const char *term_key_name(int key);
+
 // Installs signal handlers for SIGINT, SIGTERM, SIGHUP, and SIGWINCH
 // to ensure terminal raw mode, cursor visibility, mouse tracking,
 // and title are cleanly restored upon abnormal termination.

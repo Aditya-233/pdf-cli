@@ -554,17 +554,27 @@ static void viewer_handle_link_click(doc_viewer *v, int col, int row) {
 
 void viewer_switch_tab(doc_viewer *v, size_t index) {
     if (!v || index >= v->tab_count || index == v->active_tab_idx) return;
+    size_t old_idx = v->active_tab_idx;
     viewer_tab_save_config(&v->tabs[v->active_tab_idx]);
     v->active_tab_idx = index;
     term_set_title(v->tabs[v->active_tab_idx].file_path);
     char msg[128];
     snprintf(msg, sizeof(msg), "Tab %zu/%zu: %s", index + 1, v->tab_count, v->tabs[index].display_name);
     viewer_set_status(v, msg, 1000);
+    term_log_keystroke("TAB SWITCH: from tab %zu to tab %zu (\"%s\", %zu pages)",
+                       old_idx + 1, index + 1, v->tabs[index].display_name, v->tabs[index].content_page_count);
     viewer_display_current_page(v);
+}
+
+void viewer_set_active_tab(doc_viewer *v, size_t index) {
+    if (!v || index >= v->tab_count) return;
+    v->active_tab_idx = index;
 }
 
 void viewer_close_tab(doc_viewer *v, size_t index) {
     if (!v || index >= v->tab_count) return;
+    char closed_name[128] = {};
+    if (v->tabs[index].display_name) snprintf(closed_name, sizeof(closed_name), "%s", v->tabs[index].display_name);
     viewer_tab_save_config(&v->tabs[index]);
     viewer_tab_free(&v->tabs[index]);
 
@@ -573,6 +583,7 @@ void viewer_close_tab(doc_viewer *v, size_t index) {
     }
     memset(&v->tabs[v->tab_count - 1], 0, sizeof(viewer_tab));
     v->tab_count--;
+    term_log_keystroke("TAB CLOSE: closed tab %zu (\"%s\"), remaining tabs: %zu", index + 1, closed_name, v->tab_count);
 
     if (v->tab_count == 0) {
         v->want_back = false;
@@ -810,6 +821,21 @@ static void viewer_show_help(doc_viewer *v) {
     term_hide_cursor();
     term_set_title(v->tabs[v->active_tab_idx].file_path);
 
+    term_log_keystroke("================================================================================");
+    term_log_keystroke("=== pdf-cli Viewer Session Started (PID %d) ===", getpid());
+    term_log_keystroke("================================================================================");
+    term_log_keystroke("Terminal: TERM='%s' TERM_PROGRAM='%s' GFX_PROTO=%d (Cols=%d, Rows=%d, Cell=%.1fx%.1f)",
+                       getenv("TERM") ? getenv("TERM") : "",
+                       getenv("TERM_PROGRAM") ? getenv("TERM_PROGRAM") : "",
+                       term_gfx_get_proto(v->gfx), v->term_cols, v->term_rows, v->cell_w_px, v->cell_h_px);
+    term_log_keystroke("Open tabs (%zu total):", v->tab_count);
+    for (size_t i = 0; i < v->tab_count; i++) {
+        term_log_keystroke("  [%zu] %s (path: %s, pages: %zu)",
+                           i + 1, v->tabs[i].display_name, v->tabs[i].file_path, v->tabs[i].content_page_count);
+    }
+    term_log_keystroke("Active initial tab: %zu (\"%s\")",
+                       v->active_tab_idx + 1, v->tabs[v->active_tab_idx].display_name);
+
     viewer_display_current_page(v);
 
     uint64_t last_wheel_ms = 0;
@@ -818,6 +844,7 @@ static void viewer_show_help(doc_viewer *v) {
         if (term_poll_resize()) {
             term_get_size(&v->term_cols, &v->term_rows);
             term_detect_cell_size(&v->cell_w_px, &v->cell_h_px);
+            term_log_keystroke("WINDOW RESIZE: %dx%d (cell: %.1fx%.1f)", v->term_cols, v->term_rows, v->cell_w_px, v->cell_h_px);
             viewer_display_current_page(v);
         }
 
@@ -863,28 +890,49 @@ static void viewer_show_help(doc_viewer *v) {
             // Ctrl+1 .. Ctrl+9 direct tab switching
             if (key >= KEY_CTRL_1 && key <= KEY_CTRL_9) {
                 size_t target = (size_t)(key - KEY_CTRL_1);
+                term_log_keystroke("ACTION: Ctrl+%zu (or Alt+%zu) pressed. Target tab: %zu (current active: %zu/%zu)",
+                                   target + 1, target + 1, target + 1, v->active_tab_idx + 1, v->tab_count);
                 if (target < v->tab_count) {
                     viewer_switch_tab(v, target);
                 } else {
                     char tmsg[64];
                     snprintf(tmsg, sizeof(tmsg), "No tab %zu (only %zu open)", target + 1, v->tab_count);
+                    term_log_keystroke("ACTION: Target tab %zu out of range (only %zu tabs open)", target + 1, v->tab_count);
                     viewer_set_status(v, tmsg, 1000);
                     viewer_display_current_page(v);
                 }
-            } else if (key == KEY_CTRL_0) {
+            } else if (v->tab_count > 1 && key >= '1' && key <= '9') {
+                size_t target = (size_t)(key - '1');
+                term_log_keystroke("ACTION: Plain digit '%c' pressed with %zu tabs open -> Target tab: %zu",
+                                   (char)key, v->tab_count, target + 1);
+                if (target < v->tab_count) {
+                    viewer_switch_tab(v, target);
+                } else {
+                    char tmsg[64];
+                    snprintf(tmsg, sizeof(tmsg), "No tab %zu (only %zu open)", target + 1, v->tab_count);
+                    term_log_keystroke("ACTION: Target tab %zu out of range (only %zu tabs open)", target + 1, v->tab_count);
+                    viewer_set_status(v, tmsg, 1000);
+                    viewer_display_current_page(v);
+                }
+            } else if (key == KEY_CTRL_0 || (v->tab_count > 1 && key == '0')) {
+                term_log_keystroke("ACTION: Key %s pressed (Tab 10 / Last tab)", term_key_name(key));
                 if (v->tab_count >= 10) {
                     viewer_switch_tab(v, 9);
                 } else if (v->tab_count > 0) {
                     viewer_switch_tab(v, v->tab_count - 1);
                 }
             } else if (key == KEY_CTRL_TAB) {
+                term_log_keystroke("ACTION: Ctrl+Tab pressed -> Next tab");
                 viewer_next_tab(v);
             } else if (key == KEY_CTRL_SHIFT_TAB) {
+                term_log_keystroke("ACTION: Ctrl+Shift+Tab pressed -> Previous tab");
                 viewer_prev_tab(v);
             } else if (key == KEY_CTRL_W) {
+                term_log_keystroke("ACTION: Ctrl+W pressed -> Closing active tab %zu", v->active_tab_idx + 1);
                 viewer_close_tab(v, v->active_tab_idx);
                 if (v->tab_count == 0) break;
             } else if (key == KEY_CTRL_T) {
+                term_log_keystroke("ACTION: Ctrl+T pressed -> Open new tab file picker");
                 if (v->tab_count >= MAX_TABS) {
                     viewer_set_status(v, "Tab limit reached (max 10 tabs)", 1500);
                     viewer_display_current_page(v);
@@ -900,6 +948,7 @@ static void viewer_show_help(doc_viewer *v) {
                         char *sel = picker_run(files);
                         file_list_free(files);
                         if (sel) {
+                            term_log_keystroke("ACTION: Selected file from picker: '%s'", sel);
                             (void)viewer_add_tab(v, sel);
                             free(sel);
                         }
@@ -1090,18 +1139,27 @@ static void viewer_show_help(doc_viewer *v) {
                     viewer_goto_page(v, loc.page);
                 }
             } else if (key == KEY_MOUSE_LEFT || key == KEY_MOUSE_CTRL_CLICK) {
+                term_log_keystroke("ACTION: Mouse click at col=%d, row=%d (tab_count=%zu, active_tab=%zu)",
+                                   mouse_col, mouse_row, v->tab_count, v->active_tab_idx + 1);
                 if (v->tab_count > 1 && mouse_row == 1) {
+                    bool hit = false;
                     for (size_t i = 0; i < v->tab_count; i++) {
                         if (mouse_col >= v->hit_boxes[i].start_col && mouse_col <= v->hit_boxes[i].end_col) {
+                            hit = true;
                             if (v->hit_boxes[i].close_col > 0 &&
                                 mouse_col >= v->hit_boxes[i].close_col - 1 &&
                                 mouse_col <= v->hit_boxes[i].close_col + 1) {
+                                term_log_keystroke("ACTION: Clicked [x] to close tab %zu (\"%s\")", i + 1, v->tabs[i].display_name);
                                 viewer_close_tab(v, i);
                             } else {
+                                term_log_keystroke("ACTION: Clicked tab label to switch to tab %zu (\"%s\")", i + 1, v->tabs[i].display_name);
                                 viewer_switch_tab(v, i);
                             }
                             break;
                         }
+                    }
+                    if (!hit) {
+                        term_log_keystroke("ACTION: Mouse click on row 1 was outside tab labels");
                     }
                 } else {
                     viewer_handle_link_click(v, mouse_col, mouse_row);

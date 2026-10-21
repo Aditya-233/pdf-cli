@@ -16,6 +16,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <errno.h>
+#include <stdarg.h>
+#include <time.h>
 
 static volatile sig_atomic_t g_winch_received = 0;
 static term_state *g_active_ts = nullptr;
@@ -278,16 +280,112 @@ void term_clear_title(void) {
     fflush(stdout);
 }
 
-static inline int set_key(char *buf, size_t max_len, int k) {
+void term_log_keystroke(const char *fmt, ...) {
+    FILE *f = fopen("/tmp/pdfcli_keystrokes.log", "a");
+    if (!f) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_info;
+    localtime_r(&ts.tv_sec, &tm_info);
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%H:%M:%S", &tm_info);
+    fprintf(f, "[%s.%03ld pid=%d] ", time_str, ts.tv_nsec / 1000000L, (int)getpid());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+const char *term_key_name(int key) {
+    switch (key) {
+    case KEY_NONE: return "KEY_NONE";
+    case KEY_CTRL_C: return "Ctrl+C";
+    case KEY_TAB: return "Tab";
+    case KEY_ESC: return "ESC";
+    case KEY_CTRL_W: return "Ctrl+W";
+    case KEY_CTRL_T: return "Ctrl+T";
+    case KEY_PAGE_UP: return "PageUp";
+    case KEY_PAGE_DOWN: return "PageDown";
+    case KEY_ARROW_UP: return "Up";
+    case KEY_ARROW_DOWN: return "Down";
+    case KEY_ARROW_LEFT: return "Left";
+    case KEY_ARROW_RIGHT: return "Right";
+    case KEY_MOUSE_LEFT: return "MouseLeft";
+    case KEY_MOUSE_ALT_CLICK: return "MouseAltClick";
+    case KEY_MOUSE_CTRL_CLICK: return "MouseCtrlClick";
+    case KEY_MOUSE_WHEEL_UP: return "MouseWheelUp";
+    case KEY_MOUSE_WHEEL_DOWN: return "MouseWheelDown";
+    case KEY_HISTORY_BACK: return "HistoryBack";
+    case KEY_HISTORY_FORWARD: return "HistoryForward";
+    case KEY_CTRL_1: return "Ctrl+1";
+    case KEY_CTRL_2: return "Ctrl+2";
+    case KEY_CTRL_3: return "Ctrl+3";
+    case KEY_CTRL_4: return "Ctrl+4";
+    case KEY_CTRL_5: return "Ctrl+5";
+    case KEY_CTRL_6: return "Ctrl+6";
+    case KEY_CTRL_7: return "Ctrl+7";
+    case KEY_CTRL_8: return "Ctrl+8";
+    case KEY_CTRL_9: return "Ctrl+9";
+    case KEY_CTRL_0: return "Ctrl+0";
+    case KEY_CTRL_TAB: return "Ctrl+Tab";
+    case KEY_CTRL_SHIFT_TAB: return "Ctrl+Shift+Tab";
+    default: {
+        static thread_local char sbuf[32];
+        if (key >= 32 && key < 127) {
+            snprintf(sbuf, sizeof(sbuf), "'%c'", (char)key);
+        } else {
+            snprintf(sbuf, sizeof(sbuf), "code=0x%X", key);
+        }
+        return sbuf;
+    }
+    }
+}
+
+static int finish_key(int k, char *buf, size_t max_len, const unsigned char *raw_bytes, size_t raw_len, int mc, int mr) {
     if (buf && max_len > 0) {
         buf[0] = (char)k;
         if (max_len > 1) buf[1] = '\0';
+    }
+    char hex_str[192] = {};
+    char repr_str[192] = {};
+    size_t hpos = 0, rpos = 0;
+    for (size_t i = 0; i < raw_len; i++) {
+        hpos += (size_t)snprintf(hex_str + hpos, sizeof(hex_str) - hpos, "%02X ", raw_bytes[i]);
+        if (raw_bytes[i] >= 32 && raw_bytes[i] < 127 && raw_bytes[i] != '\\' && raw_bytes[i] != '"') {
+            if (rpos + 1 < sizeof(repr_str)) repr_str[rpos++] = (char)raw_bytes[i];
+        } else if (raw_bytes[i] == 27) {
+            rpos += (size_t)snprintf(repr_str + rpos, sizeof(repr_str) - rpos, "\\e");
+        } else if (raw_bytes[i] == '\t') {
+            rpos += (size_t)snprintf(repr_str + rpos, sizeof(repr_str) - rpos, "\\t");
+        } else if (raw_bytes[i] == '\r') {
+            rpos += (size_t)snprintf(repr_str + rpos, sizeof(repr_str) - rpos, "\\r");
+        } else if (raw_bytes[i] == '\n') {
+            rpos += (size_t)snprintf(repr_str + rpos, sizeof(repr_str) - rpos, "\\n");
+        } else {
+            rpos += (size_t)snprintf(repr_str + rpos, sizeof(repr_str) - rpos, "\\x%02X", raw_bytes[i]);
+        }
+    }
+    repr_str[rpos] = '\0';
+    if (mc > 0 || mr > 0) {
+        term_log_keystroke("KEY INPUT [%zu bytes]: hex=[%s] repr=\"%s\" => key=%s (0x%X) mouse=(col=%d, row=%d)",
+                           raw_len, hex_str, repr_str, term_key_name(k), k, mc, mr);
+    } else {
+        term_log_keystroke("KEY INPUT [%zu bytes]: hex=[%s] repr=\"%s\" => key=%s (0x%X)",
+                           raw_len, hex_str, repr_str, term_key_name(k), k);
     }
     return k;
 }
 
 int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *out_mouse_row) {
     if (buf && max_len > 0) buf[0] = '\0';
+    unsigned char raw_bytes[64] = {};
+    size_t raw_len = 0;
+#define RECORD_BYTE(b) do { if (raw_len < sizeof(raw_bytes)) raw_bytes[raw_len++] = (unsigned char)(b); } while (0)
+#define FINISH(k) finish_key((k), buf, max_len, raw_bytes, raw_len, 0, 0)
+#define FINISH_M(k, c, r) finish_key((k), buf, max_len, raw_bytes, raw_len, (c), (r))
+
     for (;;) {
         unsigned char b0 = 0;
         ssize_t n = read(fd, &b0, 1);
@@ -297,6 +395,7 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
             if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
+        RECORD_BYTE(b0);
         if (b0 != 27) {
             if (b0 >= 0x80) {
                 size_t needed = ((b0 & 0xE0) == 0xC0) ? 1 : (((b0 & 0xF0) == 0xE0) ? 2 : (((b0 & 0xF8) == 0xF0) ? 3 : 0));
@@ -306,40 +405,43 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
                     for (size_t i = 0; i < needed; i++) {
                         unsigned char cb = 0;
                         if (read(fd, &cb, 1) <= 0) break;
+                        RECORD_BYTE(cb);
                         buf[got++] = (char)cb;
                     }
                     buf[got] = '\0';
                     uint32_t cp = 0;
                     size_t ulen = 0;
-                    if (utf8_decode(buf, &cp, &ulen) == 0 && ulen == got) return (int)cp;
+                    if (utf8_decode(buf, &cp, &ulen) == 0 && ulen == got) return FINISH((int)cp);
                 }
                 continue;
             }
-            if (b0 == 0x09) return set_key(buf, max_len, KEY_HISTORY_BACK);
-            if (b0 == 0x0F) return set_key(buf, max_len, KEY_HISTORY_FORWARD);
-            return set_key(buf, max_len, b0);
+            if (b0 == 0x09) return FINISH(KEY_HISTORY_BACK);
+            if (b0 == 0x0F) return FINISH(KEY_HISTORY_FORWARD);
+            return FINISH(b0);
         }
 
         struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-        if (poll(&pfd, 1, 50) <= 0) return set_key(buf, max_len, 27);
+        if (poll(&pfd, 1, 50) <= 0) return FINISH(27);
         unsigned char b2 = 0;
-        if (read(fd, &b2, 1) <= 0) return set_key(buf, max_len, 27);
+        if (read(fd, &b2, 1) <= 0) return FINISH(27);
+        RECORD_BYTE(b2);
         if (b2 >= '1' && b2 <= '9') {
             // Alt+1 .. Alt+9 fallback
-            return set_key(buf, max_len, KEY_CTRL_1 + (b2 - '1'));
+            return FINISH(KEY_CTRL_1 + (b2 - '1'));
         }
         if (b2 == '0') {
-            return set_key(buf, max_len, KEY_CTRL_0);
+            return FINISH(KEY_CTRL_0);
         }
-        if (b2 != '[' && b2 != 'O') return set_key(buf, max_len, 27);
+        if (b2 != '[' && b2 != 'O') return FINISH(27);
         if (b2 == 'O') {
             unsigned char fn = 0;
-            if (read(fd, &fn, 1) <= 0) return 27;
-            if (fn == 'A') return set_key(buf, max_len, KEY_ARROW_UP);
-            if (fn == 'B') return set_key(buf, max_len, KEY_ARROW_DOWN);
-            if (fn == 'C') return set_key(buf, max_len, KEY_ARROW_RIGHT);
-            if (fn == 'D') return set_key(buf, max_len, KEY_ARROW_LEFT);
-            return 0;
+            if (read(fd, &fn, 1) <= 0) return FINISH(27);
+            RECORD_BYTE(fn);
+            if (fn == 'A') return FINISH(KEY_ARROW_UP);
+            if (fn == 'B') return FINISH(KEY_ARROW_DOWN);
+            if (fn == 'C') return FINISH(KEY_ARROW_RIGHT);
+            if (fn == 'D') return FINISH(KEY_ARROW_LEFT);
+            return FINISH(0);
         }
 
         char params[64] = {};
@@ -348,6 +450,7 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
         for (size_t i = 0; i < 32; i++) {
             unsigned char c = 0;
             if (read(fd, &c, 1) <= 0) break;
+            RECORD_BYTE(c);
             if (c >= 0x40 && c <= 0x7E) {
                 final_byte = c;
                 break;
@@ -367,13 +470,13 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
         }
 
         switch (final_byte) {
-        case 'A': return set_key(buf, max_len, shift ? 'K' : KEY_ARROW_UP);
-        case 'B': return set_key(buf, max_len, shift ? 'J' : KEY_ARROW_DOWN);
-        case 'C': return set_key(buf, max_len, super ? KEY_HISTORY_FORWARD : KEY_ARROW_RIGHT);
-        case 'D': return set_key(buf, max_len, super ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
-        case 'V': return set_key(buf, max_len, KEY_PAGE_UP);
-        case 'U': return set_key(buf, max_len, KEY_PAGE_DOWN);
-        case 'Z': return set_key(buf, max_len, KEY_CTRL_SHIFT_TAB); // Shift+Tab (backtab)
+        case 'A': return FINISH(shift ? 'K' : KEY_ARROW_UP);
+        case 'B': return FINISH(shift ? 'J' : KEY_ARROW_DOWN);
+        case 'C': return FINISH(super ? KEY_HISTORY_FORWARD : KEY_ARROW_RIGHT);
+        case 'D': return FINISH(super ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
+        case 'V': return FINISH(KEY_PAGE_UP);
+        case 'U': return FINISH(KEY_PAGE_DOWN);
+        case 'Z': return FINISH(KEY_CTRL_SHIFT_TAB); // Shift+Tab (backtab)
         case '~': {
             int p1 = 0, p2 = 0, p3 = 0;
             int n = sscanf(params, "%d;%d;%d", &p1, &p2, &p3);
@@ -384,53 +487,58 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
                 bool ctrl = (mods & 4) != 0;
                 bool s_held = (mods & 1) != 0;
                 if (ctrl) {
-                    if (kcode >= '1' && kcode <= '9') return set_key(buf, max_len, KEY_CTRL_1 + (kcode - '1'));
-                    if (kcode == '0') return set_key(buf, max_len, KEY_CTRL_0);
-                    if (kcode == '\t' || kcode == 9) return set_key(buf, max_len, s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
-                    if (kcode == 'w' || kcode == 'W') return set_key(buf, max_len, KEY_CTRL_W);
-                    if (kcode == 't' || kcode == 'T') return set_key(buf, max_len, KEY_CTRL_T);
+                    if (kcode >= '1' && kcode <= '9') return FINISH(KEY_CTRL_1 + (kcode - '1'));
+                    if (kcode == '0') return FINISH(KEY_CTRL_0);
+                    if (kcode == '\t' || kcode == 9) return FINISH(s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
+                    if (kcode == 'w' || kcode == 'W') return FINISH(KEY_CTRL_W);
+                    if (kcode == 't' || kcode == 'T') return FINISH(KEY_CTRL_T);
                 }
+            } else if (n == 2 && p2 == 5) {
+                // Alternate format: \033[<keycode>;<mods>~
+                if (p1 >= '1' && p1 <= '9') return FINISH(KEY_CTRL_1 + (p1 - '1'));
+                if (p1 == '0') return FINISH(KEY_CTRL_0);
+                if (p1 == 9 || p1 == '\t') return FINISH(KEY_CTRL_TAB);
             } else if (n >= 1) {
-                if (p1 == 5) return set_key(buf, max_len, KEY_PAGE_UP);
-                if (p1 == 6) return set_key(buf, max_len, KEY_PAGE_DOWN);
+                if (p1 == 5) return FINISH(KEY_PAGE_UP);
+                if (p1 == 6) return FINISH(KEY_PAGE_DOWN);
             }
-            return 0;
+            return FINISH(0);
         }
         case 'u': {
             int key = 0, raw_mods = 0;
             sscanf(params, "%d;%d", &key, &raw_mods);
             int mod_bits = (raw_mods > 0) ? (raw_mods - 1) : 0;
             bool s_held = (mod_bits & 1), sup_held = (mod_bits & 8);
-            if (key == 27) return set_key(buf, max_len, 27);
-            if (key == 57354 || key == 57375 || key == 57356) return set_key(buf, max_len, KEY_PAGE_UP);
-            if (key == 57355 || key == 57376 || key == 57357) return set_key(buf, max_len, KEY_PAGE_DOWN);
-            if (key == 57352) return set_key(buf, max_len, s_held ? 'K' : KEY_ARROW_UP);
-            if (key == 57353) return set_key(buf, max_len, s_held ? 'J' : KEY_ARROW_DOWN);
-            if (key == 57350) return set_key(buf, max_len, sup_held ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
-            if (key == 57351) return set_key(buf, max_len, sup_held ? KEY_HISTORY_FORWARD : KEY_ARROW_RIGHT);
+            if (key == 27) return FINISH(27);
+            if (key == 57354 || key == 57375 || key == 57356) return FINISH(KEY_PAGE_UP);
+            if (key == 57355 || key == 57376 || key == 57357) return FINISH(KEY_PAGE_DOWN);
+            if (key == 57352) return FINISH(s_held ? 'K' : KEY_ARROW_UP);
+            if (key == 57353) return FINISH(s_held ? 'J' : KEY_ARROW_DOWN);
+            if (key == 57350) return FINISH(sup_held ? KEY_HISTORY_BACK : KEY_ARROW_LEFT);
+            if (key == 57351) return FINISH(sup_held ? KEY_HISTORY_FORWARD : KEY_ARROW_RIGHT);
             if (raw_mods > 0) {
-                if ((mod_bits & 4) != 0) {
-                    if (key >= '1' && key <= '9') return set_key(buf, max_len, KEY_CTRL_1 + (key - '1'));
-                    if (key == '0') return set_key(buf, max_len, KEY_CTRL_0);
-                    if (key == '\t' || key == 9) return set_key(buf, max_len, s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
-                    if (key == 'w' || key == 'W') return set_key(buf, max_len, KEY_CTRL_W);
-                    if (key == 't' || key == 'T') return set_key(buf, max_len, KEY_CTRL_T);
-                    if (key == 'i') return set_key(buf, max_len, KEY_HISTORY_BACK);
-                    if (key == 'o') return set_key(buf, max_len, KEY_HISTORY_FORWARD);
-                    if (key == 'c') return set_key(buf, max_len, 3);
-                    if (key == 'd') return set_key(buf, max_len, 4);
-                    if (key == 'u') return set_key(buf, max_len, 21);
+                if ((mod_bits & (4 | 2)) != 0) { // Ctrl or Alt held
+                    if (key >= '1' && key <= '9') return FINISH(KEY_CTRL_1 + (key - '1'));
+                    if (key == '0') return FINISH(KEY_CTRL_0);
+                    if (key == '\t' || key == 9) return FINISH(s_held ? KEY_CTRL_SHIFT_TAB : KEY_CTRL_TAB);
+                    if (key == 'w' || key == 'W') return FINISH(KEY_CTRL_W);
+                    if (key == 't' || key == 'T') return FINISH(KEY_CTRL_T);
+                    if (key == 'i') return FINISH(KEY_HISTORY_BACK);
+                    if (key == 'o') return FINISH(KEY_HISTORY_FORWARD);
+                    if (key == 'c') return FINISH(3);
+                    if (key == 'd') return FINISH(4);
+                    if (key == 'u') return FINISH(21);
                 }
                 if ((mod_bits & 10) == 10) {
-                    if (key == '[') return set_key(buf, max_len, s_held ? KEY_UNCROP_TOP : KEY_UNCROP_LEFT);
-                    if (key == ']') return set_key(buf, max_len, s_held ? KEY_UNCROP_BOTTOM : KEY_UNCROP_RIGHT);
+                    if (key == '[') return FINISH(s_held ? KEY_UNCROP_TOP : KEY_UNCROP_LEFT);
+                    if (key == ']') return FINISH(s_held ? KEY_UNCROP_BOTTOM : KEY_UNCROP_RIGHT);
                 }
             }
             if (key > 0 && key < 128) {
                 int ch = (s_held && key >= 'a' && key <= 'z') ? (key - 'a' + 'A') : key;
-                return set_key(buf, max_len, ch);
+                return FINISH(ch);
             }
-            return 0;
+            return FINISH(0);
         }
         case 'M':
         case 'm': {
@@ -441,11 +549,11 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
                     if (out_mouse_col) *out_mouse_col = col;
                     if (out_mouse_row) *out_mouse_row = row;
                     if (final_byte == 'M') {
-                        if (btn == 0) return set_key(buf, max_len, KEY_MOUSE_LEFT);
-                        if (btn == 8) return set_key(buf, max_len, KEY_MOUSE_ALT_CLICK);
-                        if (btn == 16 || btn == 18) return set_key(buf, max_len, KEY_MOUSE_CTRL_CLICK);
-                        if (btn == 64) return set_key(buf, max_len, KEY_MOUSE_WHEEL_UP);
-                        if (btn == 65) return set_key(buf, max_len, KEY_MOUSE_WHEEL_DOWN);
+                        if (btn == 0) return FINISH_M(KEY_MOUSE_LEFT, col, row);
+                        if (btn == 8) return FINISH_M(KEY_MOUSE_ALT_CLICK, col, row);
+                        if (btn == 16 || btn == 18) return FINISH_M(KEY_MOUSE_CTRL_CLICK, col, row);
+                        if (btn == 64) return FINISH_M(KEY_MOUSE_WHEEL_UP, col, row);
+                        if (btn == 65) return FINISH_M(KEY_MOUSE_WHEEL_DOWN, col, row);
                     }
                 }
                 continue;
@@ -457,7 +565,10 @@ int term_read_key(int fd, char *buf, size_t max_len, int *out_mouse_col, int *ou
             }
             break;
         }
-        default: return 0;
+        default: return FINISH(0);
         }
     }
+#undef RECORD_BYTE
+#undef FINISH
+#undef FINISH_M
 }

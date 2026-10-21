@@ -64,6 +64,16 @@ static char *expand_path(const char *path) {
             return strdup(buf);
         }
     }
+    struct stat st;
+    if (stat(path, &st) == 0) return strdup(path);
+
+    // Fallback: check if relative to $HOME
+    const char *h = getenv("HOME");
+    if (h && path[0] != '/') {
+        char buf[PATH_MAX];
+        snprintf(buf, sizeof(buf), "%s/%s", h, path);
+        if (stat(buf, &st) == 0) return strdup(buf);
+    }
     return strdup(path);
 }
 
@@ -194,7 +204,7 @@ int main(int argc, char **argv) {
                 free(next_exp);
             }
         }
-        viewer_switch_tab(v, 0);
+        viewer_set_active_tab(v, 0);
         (void)viewer_run(v);
         viewer_destroy(v);
         return 0;

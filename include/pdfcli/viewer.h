@@ -17,6 +17,7 @@ void viewer_destroy(doc_viewer *v);
 // Multi-document tab management
 [[nodiscard]] bool viewer_add_tab(doc_viewer *v, const char *path);
 void viewer_switch_tab(doc_viewer *v, size_t index);
+void viewer_set_active_tab(doc_viewer *v, size_t index);
 void viewer_close_tab(doc_viewer *v, size_t index);
 void viewer_next_tab(doc_viewer *v);
 void viewer_prev_tab(doc_viewer *v);
