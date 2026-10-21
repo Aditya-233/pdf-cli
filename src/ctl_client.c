@@ -15,10 +15,43 @@
 #include <sys/time.h>
 #include <ctype.h>
 
-static constexpr char DEFAULT_PRESETS_JSON[] = {
-#embed "../assets/default_presets.json"
-, '\0'
-};
+static const char DEFAULT_PRESETS_JSON[] =
+    "{\n"
+    "  \"laptop\": {\n"
+    "    \"dual\": \"half\",\n"
+    "    \"fit\": \"height\",\n"
+    "    \"crop_top\": \"0.04\",\n"
+    "    \"crop_bottom\": \"0.04\",\n"
+    "    \"crop_left\": \"0.06\",\n"
+    "    \"crop_right\": \"0.06\"\n"
+    "  },\n"
+    "  \"display\": {\n"
+    "    \"dual\": \"off\",\n"
+    "    \"fit\": \"height\",\n"
+    "    \"crop\": \"0\"\n"
+    "  },\n"
+    "  \"white\": {\n"
+    "    \"tint\": \"off\"\n"
+    "  },\n"
+    "  \"pale\": {\n"
+    "    \"tint\": \"dim\"\n"
+    "  },\n"
+    "  \"dark\": {\n"
+    "    \"tint\": \"dark\"\n"
+    "  },\n"
+    "  \"invert\": {\n"
+    "    \"tint\": \"invert\"\n"
+    "  },\n"
+    "  \"trim\": {\n"
+    "    \"crop\": \"+0.02\"\n"
+    "  },\n"
+    "  \"untrim\": {\n"
+    "    \"crop\": \"-0.02\"\n"
+    "  },\n"
+    "  \"notrim\": {\n"
+    "    \"crop\": \"0\"\n"
+    "  }\n"
+    "}";
 
 typedef struct { char socket[1024]; ctl_viewer_state state; } ctl_inst;
 typedef struct { char target[256]; bool all, as_json, quiet; } ctl_opts;
