@@ -10,6 +10,8 @@ extern "C" {
 #endif
 
 [[nodiscard]] fz_pixmap *img_crop(fz_context *ctx, fz_pixmap *pix, const crop_box *crop);
+[[nodiscard]] fz_pixmap *img_fit_to_dims(fz_context *ctx, fz_pixmap *pix, int target_w, int target_h);
+[[nodiscard]] fz_pixmap *img_downsample_box(fz_context *ctx, fz_pixmap *pix, int factor);
 void img_smart_invert(fz_context *ctx, fz_pixmap *pix);
 void img_simple_invert(fz_context *ctx, fz_pixmap *pix);
 void img_dim_tint(fz_context *ctx, fz_pixmap *pix);

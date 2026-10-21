@@ -1,4 +1,5 @@
 #include "pdfcli/fuzzy_match.h"
+#include "pdfcli/profile.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -68,6 +69,7 @@ static thread_local double score_M[2][FUZZY_MAX_LEN];
 }
 
 [[nodiscard]] double fuzzy_score(const char *needle, const char *haystack) {
+    PROFILE_SCOPE("fuzzy", "fuzzy_score");
     if (!needle || !haystack) return FUZZY_SCORE_MIN;
     if (!*needle) return 0.0;
 
@@ -156,6 +158,7 @@ static thread_local double score_M[2][FUZZY_MAX_LEN];
 }
 
 [[nodiscard]] double fuzzy_match_positions(const char *needle, const char *haystack, size_t *pos, size_t max_pos) {
+    PROFILE_SCOPE("fuzzy", "fuzzy_match_positions");
     if (!pos || max_pos == 0) return fuzzy_score(needle, haystack);
     if (!needle || !haystack) return FUZZY_SCORE_MIN;
     if (!*needle) return 0.0;

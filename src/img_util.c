@@ -1,8 +1,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include "pdfcli/img_util.h"
+#include "pdfcli/profile.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>
 
 static const uint8_t smart_inv_lut[256] = {
     255, 254, 253, 252, 251, 251, 250, 249, 248, 247, 246, 245, 244, 244, 243, 242,
@@ -159,10 +161,12 @@ static const int32_t smart_inv_k[512] = {
 
 
 [[nodiscard]] fz_pixmap *img_crop(fz_context *ctx, fz_pixmap *pix, const crop_box *crop) {
+    PROFILE_SCOPE("scale", "img_crop");
     if (!ctx || !pix) return nullptr;
     if (!crop || (crop->top == 0.0 && crop->bottom == 0.0 && crop->left == 0.0 && crop->right == 0.0))
         return fz_clone_pixmap(ctx, pix);
     int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
+    PROFILE_EVENT("scale", "crop_in_pixels", "pixels", (int64_t)w * h);
     int x0 = (int)(w * crop->left), x1 = w - (int)(w * crop->right);
     int y0 = (int)(h * crop->top), y1 = h - (int)(h * crop->bottom);
     if (x0 < 0) x0 = 0;
@@ -171,7 +175,9 @@ static const int32_t smart_inv_k[512] = {
     if (y1 > h) y1 = h;
     if (x1 <= x0 || y1 <= y0) return fz_clone_pixmap(ctx, pix);
     int nw = x1 - x0, nh = y1 - y0;
+    PROFILE_EVENT("scale", "crop_out_pixels", "pixels", (int64_t)nw * nh);
     fz_pixmap *dst = nullptr;
+    fz_var(dst);
     fz_try(ctx) {
         dst = fz_new_pixmap_with_bbox(ctx, fz_pixmap_colorspace(ctx, pix), fz_make_irect(0, 0, nw, nh), nullptr, fz_pixmap_alpha(ctx, pix));
         int n = fz_pixmap_components(ctx, pix);
@@ -191,6 +197,66 @@ static const int32_t smart_inv_k[512] = {
             }
         }
     } fz_catch(ctx) { if (dst) fz_drop_pixmap(ctx, dst); dst = nullptr; }
+    return dst;
+}
+
+[[nodiscard]] fz_pixmap *img_fit_to_dims(fz_context *ctx, fz_pixmap *pix, int target_w, int target_h) {
+    PROFILE_SCOPE("scale", "img_fit_to_dims");
+    if (!ctx || !pix || target_w <= 0 || target_h <= 0) return nullptr;
+    int in_w = fz_pixmap_width(ctx, pix);
+    int in_h = fz_pixmap_height(ctx, pix);
+    PROFILE_EVENT("scale", "fit_in_pixels", "pixels", (int64_t)in_w * in_h);
+    PROFILE_EVENT("scale", "fit_target_w", "w", target_w);
+    PROFILE_EVENT("scale", "fit_target_h", "h", target_h);
+
+    double scale_x = (double)target_w / (double)in_w;
+    double scale_y = (double)target_h / (double)in_h;
+    double scale = (scale_x < scale_y) ? scale_x : scale_y;
+    int out_w = (int)(in_w * scale + 0.5);
+    int out_h = (int)(in_h * scale + 0.5);
+    if (out_w <= 0) out_w = 1;
+    if (out_h <= 0) out_h = 1;
+
+    fz_pixmap *dst = nullptr;
+    fz_var(dst);
+    fz_try(ctx) {
+        dst = fz_scale_pixmap(ctx, pix, 0, 0, (float)out_w, (float)out_h, nullptr);
+    } fz_catch(ctx) {
+        dst = nullptr;
+    }
+    if (dst) {
+        PROFILE_EVENT("scale", "fit_out_pixels", "pixels", (int64_t)out_w * out_h);
+        PROFILE_EVENT("scale", "fit_out_w", "w", out_w);
+        PROFILE_EVENT("scale", "fit_out_h", "h", out_h);
+    }
+    return dst;
+}
+
+[[nodiscard]] fz_pixmap *img_downsample_box(fz_context *ctx, fz_pixmap *pix, int factor) {
+    PROFILE_SCOPE("scale", "img_downsample_box");
+    if (!ctx || !pix || factor <= 1) return pix ? fz_clone_pixmap(ctx, pix) : nullptr;
+    int in_w = fz_pixmap_width(ctx, pix);
+    int in_h = fz_pixmap_height(ctx, pix);
+    PROFILE_EVENT("scale", "downsample_in_pixels", "pixels", (int64_t)in_w * in_h);
+    PROFILE_EVENT("scale", "downsample_factor", "factor", factor);
+
+    int out_w = in_w / factor;
+    int out_h = in_h / factor;
+    if (out_w <= 0) out_w = 1;
+    if (out_h <= 0) out_h = 1;
+
+    fz_pixmap *dst = nullptr;
+    fz_var(dst);
+    fz_try(ctx) {
+        dst = fz_scale_pixmap(ctx, pix, 0, 0, (float)out_w, (float)out_h, nullptr);
+    } fz_catch(ctx) {
+        dst = nullptr;
+    }
+    if (dst) {
+        PROFILE_EVENT("scale", "downsample_out_pixels", "pixels", (int64_t)out_w * out_h);
+        PROFILE_EVENT("scale", "downsample_out_w", "w", out_w);
+        PROFILE_EVENT("scale", "downsample_out_h", "h", out_h);
+    }
     return dst;
 }
 
@@ -315,6 +381,7 @@ static void apply_lut(fz_context *ctx, fz_pixmap *pix, const uint8_t lut[256]) {
 }
 
 void img_smart_invert(fz_context *ctx, fz_pixmap *pix) {
+    PROFILE_SCOPE("scale", "img_smart_invert");
     if (!ctx || !pix) return;
     int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
     int n = fz_pixmap_components(ctx, pix), stride = fz_pixmap_stride(ctx, pix);
@@ -382,6 +449,7 @@ void img_smart_invert(fz_context *ctx, fz_pixmap *pix) {
 }
 
 void img_simple_invert(fz_context *ctx, fz_pixmap *pix) {
+    PROFILE_SCOPE("scale", "img_simple_invert");
     if (!ctx || !pix) return;
     int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
     int n = fz_pixmap_components(ctx, pix), stride = fz_pixmap_stride(ctx, pix);
@@ -471,6 +539,7 @@ void img_simple_invert(fz_context *ctx, fz_pixmap *pix) {
 }
 
 void img_dim_tint(fz_context *ctx, fz_pixmap *pix) {
+    PROFILE_SCOPE("scale", "img_dim_tint");
     if (!ctx || !pix) return;
     int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
     int n = fz_pixmap_components(ctx, pix), stride = fz_pixmap_stride(ctx, pix);
@@ -530,6 +599,7 @@ void img_dim_tint(fz_context *ctx, fz_pixmap *pix) {
 }
 
 [[nodiscard]] unsigned char *img_save_png_to_memory(fz_context *ctx, fz_pixmap *pix, size_t *out_sz) {
+    PROFILE_SCOPE("scale", "img_save_png_to_memory");
     if (!out_sz) return nullptr;
     *out_sz = 0;
     if (!ctx || !pix) return nullptr;
@@ -561,6 +631,7 @@ void img_dim_tint(fz_context *ctx, fz_pixmap *pix) {
 }
 
 [[nodiscard]] bool img_save_png_to_file(fz_context *ctx, fz_pixmap *pix, const char *path) {
+    PROFILE_SCOPE("scale", "img_save_png_to_file");
     if (!ctx || !pix || !path) return false;
     bool ok = true;
     fz_try(ctx) { fz_save_pixmap_as_png(ctx, pix, path); } fz_catch(ctx) { ok = false; }

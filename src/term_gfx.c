@@ -23,6 +23,7 @@
 #include "pdfcli/types.h"
 #include "pdfcli/term_raw.h"
 #include "pdfcli/term_gfx.h"
+#include "pdfcli/profile.h"
 
 static constexpr char B64_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -135,10 +136,6 @@ static inline void move_cursor(int col, int row) {
 }
 
 
-static int sixel_write_cb(char *data, int size, void *priv) {
-    return size > 0 ? (int)fwrite(data, 1, (size_t)size, priv ? (FILE *)priv : stdout) : 0;
-}
-
 [[nodiscard]] term_gfx_context *term_gfx_init(void) {
     auto ctx = (term_gfx_context *)malloc(sizeof(term_gfx_context));
     if (!ctx) return nullptr;
@@ -154,6 +151,32 @@ static int sixel_write_cb(char *data, int size, void *priv) {
 static sixel_output_t *s_sixel_out = nullptr;
 static sixel_dither_t *s_sixel_dither = nullptr;
 
+typedef struct {
+    char *buf;
+    size_t len;
+    size_t cap;
+} sixel_buf_t;
+
+static sixel_buf_t s_cached_sixel = {};
+static unsigned char *s_indexed_buf = nullptr;
+static size_t s_indexed_cap = 0;
+
+static int sixel_buf_write_cb(char *data, int size, void *priv) {
+    if (size <= 0 || !data || !priv) return 0;
+    sixel_buf_t *b = (sixel_buf_t *)priv;
+    if (b->len + (size_t)size > b->cap) {
+        size_t ncap = (b->cap == 0) ? 65536 : b->cap * 2;
+        while (ncap < b->len + (size_t)size) ncap *= 2;
+        char *nb = (char *)realloc(b->buf, ncap);
+        if (!nb) return -1;
+        b->buf = nb;
+        b->cap = ncap;
+    }
+    memcpy(b->buf + b->len, data, (size_t)size);
+    b->len += (size_t)size;
+    return size;
+}
+
 static void term_gfx_sixel_cleanup(void) {
     if (s_sixel_dither) {
         sixel_dither_unref(s_sixel_dither);
@@ -163,6 +186,13 @@ static void term_gfx_sixel_cleanup(void) {
         sixel_output_unref(s_sixel_out);
         s_sixel_out = nullptr;
     }
+    free(s_cached_sixel.buf);
+    s_cached_sixel.buf = nullptr;
+    s_cached_sixel.len = 0;
+    s_cached_sixel.cap = 0;
+    free(s_indexed_buf);
+    s_indexed_buf = nullptr;
+    s_indexed_cap = 0;
 }
 
 void term_gfx_destroy(term_gfx_context *ctx) {
@@ -175,7 +205,8 @@ void term_gfx_destroy(term_gfx_context *ctx) {
 }
 
 [[nodiscard]] term_gfx_proto term_gfx_detect_protocol(void) {
-    const char *e = getenv("DOCVIEWER_GFX");
+    const char *e = getenv("PDFCLI_GFX");
+    if (!e) e = getenv("DOCVIEWER_GFX");
     if (e) {
         if (!strcasecmp(e, "kitty")) return GFX_KITTY;
         if (!strcasecmp(e, "sixel")) return GFX_SIXEL;
@@ -283,10 +314,13 @@ void term_gfx_clear_last_image(term_gfx_context *ctx) {
 }
 
 [[nodiscard]] bool term_gfx_draw_kitty_png_mem(uint32_t id, const unsigned char *bytes, size_t sz, int col, int row, int wc, int hc) {
+    PROFILE_SCOPE("gfx", "term_gfx_kitty_png_mem");
     if (!bytes || sz == 0) return false;
+    PROFILE_EVENT("gfx", "kitty_png_bytes", "bytes", (int64_t)sz);
     size_t b64_len = 0;
     char *b64 = base64_encode(bytes, sz, &b64_len);
     if (!b64) return false;
+    PROFILE_EVENT("gfx", "kitty_b64_bytes", "bytes", (int64_t)b64_len);
     move_cursor(col, row);
     constexpr size_t CHUNK = 4096;
     for (size_t off = 0; off < b64_len; off += CHUNK) {
@@ -295,12 +329,15 @@ void term_gfx_clear_last_image(term_gfx_context *ctx) {
         if (off == 0) printf("\033_Ga=T,f=100,i=%u,c=%d,r=%d,q=2,m=%d;%.*s\033\\", id, wc, hc, more, (int)clen, b64 + off);
         else printf("\033_Gm=%d,q=2;%.*s\033\\", more, (int)clen, b64 + off);
     }
+    PROFILE_START("gfx", "stdout_flush");
     fflush(stdout);
+    PROFILE_END("gfx", "stdout_flush");
     free(b64);
     return true;
 }
 
 [[nodiscard]] bool term_gfx_draw_kitty_png_file(uint32_t id, const char *path, int col, int row, int wc, int hc, kitty_xfer_mode mode) {
+    PROFILE_SCOPE("gfx", "term_gfx_kitty_png_file");
     if (!path || !*path) return false;
     if (mode == KITTY_XFER_FILE) {
         char rpath[PATH_MAX];
@@ -309,7 +346,9 @@ void term_gfx_clear_last_image(term_gfx_context *ctx) {
             if (b64) {
                 move_cursor(col, row);
                 printf("\033_Ga=T,f=100,t=f,c=%d,r=%d,i=%u,q=2;%s\033\\", wc, hc, id, b64);
+                PROFILE_START("gfx", "stdout_flush");
                 fflush(stdout);
+                PROFILE_END("gfx", "stdout_flush");
                 free(b64);
                 return true;
             }
@@ -331,9 +370,15 @@ void term_gfx_kitty_delete_image(uint32_t id) {
 }
 
 [[nodiscard]] bool term_gfx_draw_sixel(const fz_pixmap *pix, int col, int row, [[maybe_unused]] int wp, [[maybe_unused]] int hp) {
+    PROFILE_SCOPE("gfx", "term_gfx_draw_sixel");
     if (!pix || !pix->samples || pix->w <= 0 || pix->h <= 0) return false;
+    PROFILE_EVENT("gfx", "sixel_pixels", "pixels", (int64_t)pix->w * pix->h);
+
     move_cursor(col, row);
+    PROFILE_START("gfx", "stdout_flush");
     fflush(stdout);
+    PROFILE_END("gfx", "stdout_flush");
+
     int fmt = (pix->n == 4) ? SIXEL_PIXELFORMAT_RGBA8888 : ((pix->n == 3) ? SIXEL_PIXELFORMAT_RGB888 : ((pix->n == 2) ? SIXEL_PIXELFORMAT_GA88 : SIXEL_PIXELFORMAT_G8));
     const unsigned char *samples = pix->samples;
     unsigned char *cbuf = nullptr;
@@ -347,11 +392,14 @@ void term_gfx_kitty_delete_image(uint32_t id) {
         samples = cbuf;
     }
 
-    if (!s_sixel_out) {
-        if (!SIXEL_SUCCEEDED(sixel_output_new(&s_sixel_out, sixel_write_cb, stdout, nullptr))) {
-            free(cbuf);
-            return false;
-        }
+    s_cached_sixel.len = 0;
+    if (s_sixel_out) {
+        sixel_output_unref(s_sixel_out);
+        s_sixel_out = nullptr;
+    }
+    if (!SIXEL_SUCCEEDED(sixel_output_new(&s_sixel_out, sixel_buf_write_cb, &s_cached_sixel, nullptr))) {
+        free(cbuf);
+        return false;
     }
     if (!s_sixel_dither) {
         if (!SIXEL_SUCCEEDED(sixel_dither_new(&s_sixel_dither, 256, nullptr))) {
@@ -360,7 +408,7 @@ void term_gfx_kitty_delete_image(uint32_t id) {
         }
     }
 
-    if (!SIXEL_SUCCEEDED(sixel_dither_initialize(s_sixel_dither, (unsigned char *)samples, pix->w, pix->h, fmt, SIXEL_LARGE_AUTO, SIXEL_REP_AUTO, SIXEL_QUALITY_AUTO))) {
+    if (!SIXEL_SUCCEEDED(sixel_dither_initialize(s_sixel_dither, (unsigned char *)samples, pix->w, pix->h, fmt, SIXEL_LARGE_AUTO, SIXEL_REP_AUTO, SIXEL_QUALITY_LOW))) {
         free(cbuf);
         return false;
     }
@@ -368,19 +416,31 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     unsigned char *palette = sixel_dither_get_palette(s_sixel_dither);
     int num_colors = sixel_dither_get_num_of_palette_colors(s_sixel_dither);
     if (!palette || num_colors <= 0) {
+        PROFILE_START("gfx", "sixel_encode");
         bool ok = SIXEL_SUCCEEDED(sixel_encode((unsigned char *)samples, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
+        PROFILE_END("gfx", "sixel_encode");
         free(cbuf);
-        fflush(stdout);
+        if (ok && s_cached_sixel.len > 0) {
+            PROFILE_START("gfx", "stdout_flush");
+            fwrite(s_cached_sixel.buf, 1, s_cached_sixel.len, stdout);
+            fflush(stdout);
+            PROFILE_END("gfx", "stdout_flush");
+        }
         return ok;
     }
 
-    unsigned char *indexed = malloc((size_t)pix->w * (size_t)pix->h);
-    if (!indexed) {
-        bool ok = SIXEL_SUCCEEDED(sixel_encode((unsigned char *)samples, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
-        free(cbuf);
-        fflush(stdout);
-        return ok;
+    size_t total_px = (size_t)pix->w * (size_t)pix->h;
+    if (total_px > s_indexed_cap) {
+        size_t ncap = total_px + 65536;
+        unsigned char *nb = (unsigned char *)realloc(s_indexed_buf, ncap);
+        if (!nb) {
+            free(cbuf);
+            return false;
+        }
+        s_indexed_buf = nb;
+        s_indexed_cap = ncap;
     }
+    unsigned char *indexed = s_indexed_buf;
 
     // Fast color quantization lookup cache (15-bit RGB direct-mapped table, 64KB on stack)
     uint16_t lut[32768];
@@ -406,7 +466,6 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     uint16_t bg_key = (uint16_t)((((uint16_t)(bg_r >> 3)) << 10) | (((uint16_t)(bg_g >> 3)) << 5) | ((uint16_t)(bg_b >> 3)));
     lut[bg_key] = (uint16_t)(0x8000 | bg_idx);
 
-    size_t total_px = (size_t)pix->w * (size_t)pix->h;
     size_t comp = (size_t)pix->n;
     for (size_t i = 0; i < total_px; i++) {
         uint8_t r, g, b;
@@ -447,10 +506,18 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     }
 
     sixel_dither_set_pixelformat(s_sixel_dither, SIXEL_PIXELFORMAT_PAL8);
+    sixel_dither_set_diffusion_type(s_sixel_dither, SIXEL_DIFFUSE_NONE);
+    PROFILE_START("gfx", "sixel_encode");
     bool ok = SIXEL_SUCCEEDED(sixel_encode(indexed, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
-    free(indexed);
+    PROFILE_END("gfx", "sixel_encode");
     free(cbuf);
-    fflush(stdout);
+
+    if (ok && s_cached_sixel.len > 0) {
+        PROFILE_START("gfx", "stdout_flush");
+        fwrite(s_cached_sixel.buf, 1, s_cached_sixel.len, stdout);
+        fflush(stdout);
+        PROFILE_END("gfx", "stdout_flush");
+    }
     return ok;
 }
 
@@ -469,7 +536,9 @@ void term_gfx_kitty_delete_image(uint32_t id) {
 }
 
 [[nodiscard]] bool term_gfx_draw_halfblocks(const fz_pixmap *pix, int col, int row, int max_cols, int max_rows) {
+    PROFILE_SCOPE("gfx", "term_gfx_halfblocks");
     if (!pix || !pix->samples || pix->w <= 0 || pix->h <= 0) return false;
+    PROFILE_EVENT("gfx", "halfblocks_pixels", "pixels", (int64_t)pix->w * pix->h);
     int nc = (max_cols > 0 && pix->w > max_cols) ? max_cols : pix->w;
     int nr = (pix->h + 1) / 2;
     if (max_rows > 0 && nr > max_rows) nr = max_rows;
@@ -555,7 +624,9 @@ void term_gfx_kitty_delete_image(uint32_t id) {
 
     free(line_buf);
     free(px_map);
+    PROFILE_START("gfx", "stdout_flush");
     fflush(stdout);
+    PROFILE_END("gfx", "stdout_flush");
     return true;
 }
 
@@ -569,7 +640,13 @@ void term_gfx_clear(term_gfx_context *ctx) {
 }
 
 [[nodiscard]] bool term_gfx_draw_pixmap(term_gfx_context *ctx, fz_context *fzctx, fz_pixmap *pix, const char *path, int col, int row, int wc, int hc, int wp, int hp) {
+    PROFILE_SCOPE("gfx", "term_gfx_draw_pixmap");
     if (!ctx) return false;
+    PROFILE_EVENT("gfx", "draw_pixmap_proto", "proto", (int64_t)ctx->proto);
+    if (pix) {
+        PROFILE_EVENT("gfx", "draw_pixmap_w", "w", pix->w);
+        PROFILE_EVENT("gfx", "draw_pixmap_h", "h", pix->h);
+    }
     if (ctx->proto == GFX_KITTY) {
         uint32_t nid = term_gfx_next_image_id();
         bool ok = false;

@@ -6,3 +6,5 @@ build/
 depends/dvtm/
 depends/libtermkey/
 depends/termbox2/
+trace.json
+*.trace

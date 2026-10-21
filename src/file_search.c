@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "pdfcli/file_search.h"
+#include "pdfcli/profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,7 @@ static void file_list_append(file_list *l, const char *path) {
 }
 
 static void walk_dir(const char *base, file_list *l, int depth) {
+    PROFILE_SCOPE("fs", "file_search_walk_dir");
     if (depth > 6 || l->count > 5000) return;
     DIR *d = opendir(base);
     if (!d) return;
@@ -150,6 +152,7 @@ static void walk_dir(const char *base, file_list *l, int depth) {
 }
 
 [[nodiscard]] file_list *file_search_dir(const char *dir) {
+    PROFILE_SCOPE("fs", "file_search_dir");
     auto l = (file_list *)calloc(1, sizeof(file_list));
     if (!l) return nullptr;
     walk_dir(dir, l, 0);
@@ -157,6 +160,7 @@ static void walk_dir(const char *base, file_list *l, int depth) {
 }
 
 [[nodiscard]] file_list *file_search_broad(void) {
+    PROFILE_SCOPE("fs", "file_search_broad");
     auto l = (file_list *)calloc(1, sizeof(file_list));
     if (!l) return nullptr;
     const char *home = getenv("HOME");

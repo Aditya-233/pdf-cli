@@ -1,5 +1,6 @@
 #include "pdfcli/ctl_server.h"
 #include "pdfcli/ctl_proto.h"
+#include "pdfcli/profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +60,7 @@ void ctl_server_destroy(ctl_server *srv) {
 }
 
 [[nodiscard]] bool ctl_server_recv(ctl_server *srv, int *out_client_fd, char *cmd, size_t cmd_sz, char *args, size_t args_sz) {
+    PROFILE_SCOPE("ipc", "ctl_server_recv");
     if (!srv || srv->listen_fd < 0 || !out_client_fd || !cmd) return false;
     *out_client_fd = -1;
     int client = accept(srv->listen_fd, nullptr, nullptr);
@@ -84,6 +86,7 @@ void ctl_server_destroy(ctl_server *srv) {
 }
 
 void ctl_server_send_response(int client_fd, const char *json) {
+    PROFILE_SCOPE("ipc", "ctl_server_send_response");
     if (client_fd < 0) return;
     if (json) {
         size_t len = strlen(json), off = 0;

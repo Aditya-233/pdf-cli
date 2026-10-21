@@ -29,6 +29,7 @@ SRCS=(
     src/ctl_client.c
     src/cache.c
     src/prefetch.c
+    src/profile.c
     src/file_watcher.c
     src/arena.c
     depends/yyjson/src/yyjson.c

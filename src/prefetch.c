@@ -1,5 +1,6 @@
 #include "pdfcli/prefetch.h"
 #include "pdfcli/img_util.h"
+#include "pdfcli/profile.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -28,7 +29,9 @@ struct prefetch_queue {
 static void *prefetch_worker(void *arg) {
     auto pq = (prefetch_queue *)arg;
     while (true) {
+        PROFILE_START("prefetch", "prefetch_mutex_lock");
         pthread_mutex_lock(&pq->lock);
+        PROFILE_END("prefetch", "prefetch_mutex_lock");
         while (pq->running && !pq->job_head) {
             pthread_cond_wait(&pq->cond, &pq->lock);
         }
@@ -46,16 +49,23 @@ static void *prefetch_worker(void *arg) {
         struct prefetch_job job = *job_node;
         free(job_node);
 
+        PROFILE_START("prefetch", "prefetch_worker_task");
+        PROFILE_EVENT("prefetch", "job_page", "page", job.page_num);
+
         char key[256];
         cache_make_key(key, sizeof(key), job.page_num, job.fit, job.tint, job.zoom, &job.crop, job.cols, job.rows, 0);
 
         // Fast O(1) check: if already cached, skip rendering
         if (pq->cache && cache_contains(pq->cache, key)) {
+            PROFILE_END("prefetch", "prefetch_worker_task");
             continue;
         }
 
         fz_context *ctx = doc_get_context(pq->doc);
-        if (!ctx) continue;
+        if (!ctx) {
+            PROFILE_END("prefetch", "prefetch_worker_task");
+            continue;
+        }
 
         fz_pixmap *pix = doc_render_page_pixmap(pq->doc, job.page_num, 1.0, job.dpi);
         if (pix) {
@@ -78,6 +88,7 @@ static void *prefetch_worker(void *arg) {
                 (void)write(pq->notify_fd, &val, sizeof(val));
             }
         }
+        PROFILE_END("prefetch", "prefetch_worker_task");
     }
     return nullptr;
 }
@@ -139,6 +150,7 @@ void prefetch_request(
     int rows,
     double dpi
 ) {
+    PROFILE_SCOPE("prefetch", "prefetch_request");
     if (!pq) return;
 
     // Fast O(1) check: avoid redundant enqueue if page is already present in cache

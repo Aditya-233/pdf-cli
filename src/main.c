@@ -22,6 +22,7 @@
 #include "pdfcli/picker.h"
 #include "pdfcli/menu.h"
 #include "pdfcli/term_raw.h"
+#include "pdfcli/profile.h"
 
 static void print_help(void) {
     puts("pdf-cli (C23) - Terminal-based document viewer\n\n"
@@ -30,6 +31,7 @@ static void print_help(void) {
          "OPTIONS:\n"
          "  -h, --help     Show help\n"
          "  -v, --version  Show version\n"
+         "  --profile      Enable latency & memory profiling (flushes trace.json on exit)\n"
          "  ctl ...        Control running viewers (see: pdf-cli ctl help)\n\n"
          "TAB NAVIGATION:\n"
          "  Ctrl+1 .. Ctrl+9 (Alt+1..9) Switch directly to tab 1 through 9\n"
@@ -41,10 +43,12 @@ static void print_help(void) {
          "  Mouse Left on Tab Bar        Click tab to switch / click × to close\n"
          "  Mouse Wheel on Tab Bar       Cycle through tabs\n\n"
          "KEYBOARD SHORTCUTS:\n"
-         "  j, Down        Scroll down (line) / Next page (fit-height)\n"
-         "  k, Up          Scroll up (line) / Prev page (fit-height)\n"
-         "  PgDn, Space    Continuous smooth scroll down / Page down\n"
-         "  PgUp           Continuous smooth scroll up / Page up\n"
+         "  PgDn, Space, d Smooth scroll down (screen)\n"
+         "  PgUp, u        Smooth scroll up (screen)\n"
+         "  j, Down        Scroll down (line)\n"
+         "  k, Up          Scroll up (line)\n"
+         "  Right, n       Next page\n"
+         "  Left, p        Previous page\n"
          "  g              Jump to specific page number (or 'gt'/'gT' for tabs)\n"
          "  f              Cycle fit modes (fit-width continuous / fit-height)\n"
          "  D              Cycle tint (white/dim/dark/invert)\n"
@@ -123,6 +127,12 @@ static bool run_viewer_loop(const char *initial_path, const char *search_dir) {
     return true;
 }
 
+static void profile_signal_handler(int sig) {
+    (void)sig;
+    profile_shutdown();
+    _exit(0);
+}
+
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #if defined(__linux__)
@@ -133,6 +143,36 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD, 64 * 1024);
     mallopt(M_TRIM_THRESHOLD, 64 * 1024);
 #endif
+
+    bool profile_flag = false;
+    const char *env_prof = getenv("PDFCLI_PROFILE");
+    if (env_prof && (strcmp(env_prof, "1") == 0 || strcasecmp(env_prof, "true") == 0)) {
+        profile_flag = true;
+    }
+
+    int new_argc = 0;
+    char **new_argv = (char **)malloc((size_t)(argc + 1) * sizeof(char *));
+    if (new_argv) {
+        for (int i = 0; i < argc; i++) {
+            if (strcmp(argv[i], "--profile") == 0) {
+                profile_flag = true;
+            } else {
+                new_argv[new_argc++] = argv[i];
+            }
+        }
+        new_argv[new_argc] = nullptr;
+        argc = new_argc;
+        argv = new_argv;
+    }
+
+    profile_init(profile_flag, "trace.json");
+    if (profile_is_enabled()) {
+        atexit(profile_shutdown);
+        signal(SIGINT, profile_signal_handler);
+        signal(SIGTERM, profile_signal_handler);
+        signal(SIGQUIT, profile_signal_handler);
+        signal(SIGUSR1, profile_signal_handler);
+    }
 
     if (strcmp(basename(argv[0]), "dvctl") == 0) return ctl_client_main(argc, argv);
     if (argc > 1 && strcmp(argv[1], "ctl") == 0) return ctl_client_main(argc - 1, argv + 1);
@@ -207,6 +247,8 @@ int main(int argc, char **argv) {
         viewer_set_active_tab(v, 0);
         (void)viewer_run(v);
         viewer_destroy(v);
+        profile_shutdown();
+        if (new_argv) free(new_argv);
         return 0;
     }
 
@@ -222,5 +264,7 @@ int main(int argc, char **argv) {
     free(pc);
     run_viewer_loop(exp, dir);
     free(exp); free(dir);
+    profile_shutdown();
+    if (new_argv) free(new_argv);
     return 0;
 }

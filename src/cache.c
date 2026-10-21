@@ -1,4 +1,5 @@
 #include "pdfcli/cache.h"
+#include "pdfcli/profile.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -17,6 +18,8 @@ struct cache_node {
     uint64_t hash;
     char *png_path;
     fz_pixmap *pix;
+    fz_context *ctx;
+    size_t bytes;
     struct cache_node *prev;
     struct cache_node *next;
     struct cache_node *hash_prev;
@@ -26,6 +29,7 @@ struct cache_node {
 struct page_cache {
     size_t max_entries;
     size_t count;
+    size_t total_bytes;
     struct cache_node *head;
     struct cache_node *tail;
     struct cache_node *buckets[CACHE_BUCKET_COUNT];
@@ -121,11 +125,15 @@ static struct cache_node *find_and_promote(page_cache *c, const char *key, uint6
     return n;
 }
 
-static void free_node(fz_context *ctx, struct cache_node *n) {
+static void free_node(fz_context *fallback_ctx, struct cache_node *n) {
     if (!n) return;
     free(n->key);
     free(n->png_path);
-    if (n->pix && ctx) fz_drop_pixmap(ctx, n->pix);
+    fz_context *c = n->ctx ? n->ctx : fallback_ctx;
+    if (n->pix && c) {
+        fz_drop_pixmap(c, n->pix);
+        n->pix = nullptr;
+    }
     free(n);
 }
 
@@ -139,6 +147,8 @@ void cache_clear(page_cache *c, fz_context *ctx) {
     c->head = c->tail = nullptr;
     memset(c->buckets, 0, sizeof(c->buckets));
     c->count = 0;
+    c->total_bytes = 0;
+    profile_record_cache(0, c->max_entries * 4 * 1024 * 1024, 0);
 #if defined(__linux__)
     malloc_trim(0);
 #endif
@@ -153,11 +163,17 @@ void cache_destroy(page_cache *c, fz_context *ctx) {
 }
 
 [[nodiscard]] fz_pixmap *cache_get(page_cache *c, fz_context *ctx, const char *key) {
+    PROFILE_SCOPE("cache", "cache_get");
     if (!c || !key) return nullptr;
     uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
     struct cache_node *n = find_and_promote(c, key, hash);
     fz_pixmap *ret = (n && n->pix && ctx) ? fz_keep_pixmap(ctx, n->pix) : nullptr;
+    if (ret) {
+        PROFILE_EVENT("cache", "cache_hit", "hit", 1);
+    } else {
+        PROFILE_EVENT("cache", "cache_miss", "miss", 1);
+    }
     pthread_mutex_unlock(&c->lock);
     return ret;
 }
@@ -183,27 +199,38 @@ void cache_destroy(page_cache *c, fz_context *ctx) {
 }
 
 void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, const char *png_path) {
+    PROFILE_SCOPE("cache", "cache_put");
     if (!c || !key) return;
     uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
+    size_t pix_bytes = (pix && ctx) ? fz_pixmap_size(ctx, pix) : 0;
     struct cache_node *n = find_and_promote(c, key, hash);
     if (n) {
-        if (n->pix && ctx) fz_drop_pixmap(ctx, n->pix);
+        if (n->pix) {
+            fz_context *old_c = n->ctx ? n->ctx : ctx;
+            if (old_c) fz_drop_pixmap(old_c, n->pix);
+            c->total_bytes = (c->total_bytes >= n->bytes) ? (c->total_bytes - n->bytes) : 0;
+        }
+        n->ctx = ctx;
         n->pix = (pix && ctx) ? fz_keep_pixmap(ctx, pix) : nullptr;
+        n->bytes = pix_bytes;
+        c->total_bytes += pix_bytes;
         free(n->png_path);
         n->png_path = png_path ? strdup(png_path) : nullptr;
+        profile_record_cache(c->total_bytes, c->max_entries * 4 * 1024 * 1024, c->count);
         pthread_mutex_unlock(&c->lock);
         return;
     }
-    if (c->count >= c->max_entries && c->tail) {
+    while ((c->count >= c->max_entries || (c->total_bytes > 32 * 1024 * 1024 && c->count > 1)) && c->tail) {
+        PROFILE_START("cache", "cache_eviction");
         struct cache_node *old = c->tail;
         remove_lru_node(c, old);
         hash_remove(c, old);
+        c->total_bytes = (c->total_bytes >= old->bytes) ? (c->total_bytes - old->bytes) : 0;
         free_node(ctx, old);
         c->count--;
-#if defined(__linux__)
-        malloc_trim(0);
-#endif
+        PROFILE_END("cache", "cache_eviction");
+        PROFILE_EVENT("cache", "cache_eviction_event", "evicted", 1);
     }
     n = calloc(1, sizeof(struct cache_node));
     if (!n) {
@@ -217,11 +244,15 @@ void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, 
         return;
     }
     n->hash = hash;
+    n->ctx = ctx;
     n->pix = (pix && ctx) ? fz_keep_pixmap(ctx, pix) : nullptr;
+    n->bytes = pix_bytes;
+    c->total_bytes += pix_bytes;
     n->png_path = png_path ? strdup(png_path) : nullptr;
     push_lru_front(c, n);
     hash_insert(c, n);
     c->count++;
+    profile_record_cache(c->total_bytes, c->max_entries * 4 * 1024 * 1024, c->count);
     pthread_mutex_unlock(&c->lock);
 }
 

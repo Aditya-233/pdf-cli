@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "pdfcli/doc_engine.h"
+#include "pdfcli/profile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,8 +18,9 @@ struct doc_handle {
 };
 
 [[nodiscard]] doc_handle *doc_open(const char *path) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_open");
     if (!path) return nullptr;
-    fz_context *ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+    fz_context *ctx = fz_new_context(profile_get_fitz_alloc(), nullptr, FZ_STORE_DEFAULT);
     if (!ctx) return nullptr;
     fz_register_document_handlers(ctx);
     fz_document *doc = nullptr;
@@ -35,6 +37,7 @@ struct doc_handle {
 }
 
 void doc_close(doc_handle *h) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_close");
     if (!h) return;
     pthread_mutex_lock(&h->mu);
     if (h->doc) { fz_drop_document(h->ctx, h->doc); h->doc = nullptr; }
@@ -45,12 +48,17 @@ void doc_close(doc_handle *h) {
 }
 
 [[nodiscard]] fz_context *doc_get_context(doc_handle *h) { return h ? h->ctx : nullptr; }
-[[nodiscard]] int doc_get_page_count(doc_handle *h) { return h ? h->page_count : 0; }
+[[nodiscard]] int doc_get_page_count(doc_handle *h) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_page_count");
+    return h ? h->page_count : 0;
+}
 
 [[nodiscard]] bool doc_page_has_visual_content(doc_handle *h, int page_num) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_has_visual_content");
     if (!h || !h->ctx || !h->doc || page_num < 0 || page_num >= h->page_count) return false;
     pthread_mutex_lock(&h->mu);
     bool has_content = false;
+    fz_var(has_content);
     fz_try(h->ctx) {
         fz_page *p = fz_load_page(h->ctx, h->doc, page_num);
         if (p) {
@@ -64,6 +72,7 @@ void doc_close(doc_handle *h) {
 }
 
 [[nodiscard]] fz_rect doc_get_page_bounds(doc_handle *h, int page_num) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_page_dims");
     fz_rect empty = { 0, 0, 0, 0 };
     if (!h || !h->ctx || !h->doc || page_num < 0 || page_num >= h->page_count) return empty;
     pthread_mutex_lock(&h->mu);
@@ -71,17 +80,26 @@ void doc_close(doc_handle *h) {
     fz_var(b);
     fz_try(h->ctx) {
         fz_page *p = fz_load_page(h->ctx, h->doc, page_num);
-        if (p) { b = fz_bound_page(h->ctx, p); fz_drop_page(h->ctx, p); }
+        if (p) {
+            b = fz_bound_page(h->ctx, p);
+            fz_drop_page(h->ctx, p);
+            PROFILE_EVENT("doc_engine", "page_dim_w", "w", (int64_t)(b.x1 - b.x0));
+            PROFILE_EVENT("doc_engine", "page_dim_h", "h", (int64_t)(b.y1 - b.y0));
+        }
     } fz_catch(h->ctx) { b = empty; }
     pthread_mutex_unlock(&h->mu);
     return b;
 }
 
 [[nodiscard]] fz_pixmap *doc_render_page_pixmap(doc_handle *h, int page_num, double zoom, double dpi) {
+    PROFILE_SCOPE("raster", "doc_engine_render_page");
     if (!h || !h->ctx || !h->doc || page_num < 0 || page_num >= h->page_count) return nullptr;
+    float scale = (dpi > 0 ? (float)dpi / 72.0f : 1.0f) * (zoom > 0 ? (float)zoom : 1.0f);
+    PROFILE_EVENT("raster", "render_page_num", "page", page_num);
+    PROFILE_EVENT("raster", "render_scale_pct", "scale_pct", (int64_t)(scale * 100.0f));
     pthread_mutex_lock(&h->mu);
     fz_pixmap *pix = nullptr;
-    float scale = (dpi > 0 ? (float)dpi / 72.0f : 1.0f) * (zoom > 0 ? (float)zoom : 1.0f);
+    fz_var(pix);
     fz_try(h->ctx) {
         fz_page *p = fz_load_page(h->ctx, h->doc, page_num);
         if (p) {
@@ -91,16 +109,28 @@ void doc_close(doc_handle *h) {
         }
     } fz_catch(h->ctx) { pix = nullptr; }
     pthread_mutex_unlock(&h->mu);
+    if (pix) {
+        PROFILE_EVENT("raster", "render_dims_w", "w", pix->w);
+        PROFILE_EVENT("raster", "render_dims_h", "h", pix->h);
+    }
     return pix;
 }
 
 [[nodiscard]] fz_pixmap *doc_render_page_viewport(doc_handle *h, int page_num, double scale, int sx, int sy, int vw, int vh) {
+    PROFILE_SCOPE("raster", "doc_engine_render_viewport");
     if (!h || !h->ctx || !h->doc || page_num < 0 || vw <= 0 || vh <= 0) return nullptr;
     if (scale <= 0.0) scale = 1.0;
+    PROFILE_EVENT("raster", "viewport_page_num", "page", page_num);
+    PROFILE_EVENT("raster", "viewport_scale_pct", "scale_pct", (int64_t)(scale * 100.0));
+    PROFILE_EVENT("raster", "viewport_target_w", "vw", vw);
+    PROFILE_EVENT("raster", "viewport_target_h", "vh", vh);
     pthread_mutex_lock(&h->mu);
     fz_pixmap *pix = nullptr;
     fz_page *p = nullptr;
     fz_device *dev = nullptr;
+    fz_var(pix);
+    fz_var(p);
+    fz_var(dev);
     fz_try(h->ctx) {
         p = fz_load_page(h->ctx, h->doc, page_num);
         if (p) {
@@ -117,6 +147,10 @@ void doc_close(doc_handle *h) {
         if (p) fz_drop_page(h->ctx, p);
     } fz_catch(h->ctx) { if (pix) fz_drop_pixmap(h->ctx, pix); pix = nullptr; }
     pthread_mutex_unlock(&h->mu);
+    if (pix) {
+        PROFILE_EVENT("raster", "viewport_dims_w", "w", pix->w);
+        PROFILE_EVENT("raster", "viewport_dims_h", "h", pix->h);
+    }
     return pix;
 }
 
@@ -182,6 +216,7 @@ static void walk_outline(fz_context *ctx, fz_document *doc, fz_outline *o, int l
 }
 
 [[nodiscard]] doc_toc_entry *doc_get_toc(doc_handle *h, size_t *out_cnt) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_get_toc");
     if (!out_cnt) return nullptr;
     *out_cnt = 0;
     if (!h || !h->ctx || !h->doc) return nullptr;
@@ -205,12 +240,16 @@ void doc_free_toc(doc_toc_entry *toc, size_t count) {
 }
 
 [[nodiscard]] doc_search_hit *doc_search_text(doc_handle *h, const char *needle, size_t *out_cnt) {
+    PROFILE_SCOPE("doc_engine", "doc_engine_search_text");
     if (!out_cnt) return nullptr;
     *out_cnt = 0;
     if (!h || !h->ctx || !h->doc || !needle || !*needle) return nullptr;
     pthread_mutex_lock(&h->mu);
     doc_search_hit *hits = nullptr; size_t count = 0, cap = 16;
     hits = (doc_search_hit *)calloc(cap, sizeof(doc_search_hit));
+    fz_var(hits);
+    fz_var(count);
+    fz_var(cap);
     fz_try(h->ctx) {
         for (int p = 0; p < h->page_count; p++) {
             fz_page *page = fz_load_page(h->ctx, h->doc, p);
@@ -234,6 +273,7 @@ void doc_free_search_hits(doc_search_hit *hits, size_t count) { (void)count; fre
     if (!h || !h->ctx || !path) return nullptr;
     pthread_mutex_lock(&h->mu);
     fz_pixmap *pix = nullptr;
+    fz_var(pix);
     fz_try(h->ctx) {
         fz_image *img = fz_new_image_from_file(h->ctx, path);
         if (img) {

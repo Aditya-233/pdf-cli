@@ -3,6 +3,7 @@
 #endif
 #include "pdfcli/ctl_client.h"
 #include "pdfcli/ctl_proto.h"
+#include "pdfcli/profile.h"
 #include <yyjson.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,6 +58,7 @@ typedef struct { char socket[1024]; ctl_viewer_state state; } ctl_inst;
 typedef struct { char target[256]; bool all, as_json, quiet; } ctl_opts;
 
 static bool ctl_dial(const char *path, const char *req, char **resp, bool *dead) {
+    PROFILE_SCOPE("ipc", "ctl_client_dial");
     if (dead) *dead = false;
     if (resp) *resp = nullptr;
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -199,6 +201,7 @@ static void ctl_print_states(const ctl_viewer_state *st, size_t cnt) {
 }
 
 int ctl_client_main(int argc, char **argv) {
+    PROFILE_SCOPE("ipc", "ctl_client_main");
     ctl_opts opts = {};
     int cmd_idx = 1;
     while (cmd_idx < argc && argv[cmd_idx][0] == '-') {
