@@ -44,16 +44,62 @@ static char *base64_encode(const unsigned char *src, size_t len, size_t *out_len
     }
     size_t enc_len = ((len + 2) / 3) * 4;
     char *out = malloc(enc_len + 1);
-    if (!out) return nullptr;
+    if (!out) {
+        if (out_len) *out_len = 0;
+        return nullptr;
+    }
     size_t s = 0, d = 0;
-    while (s < len) {
+
+    // Fast path: load 4 bytes (contains 3 bytes to encode) using 32-bit register packing and bit shifts
+    while (s + 4 <= len) {
+        uint32_t raw;
+        memcpy(&raw, src + s, sizeof(uint32_t));
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        uint32_t n = __builtin_bswap32(raw) >> 8;
+#else
+        uint32_t n = raw >> 8;
+#endif
+        uint32_t c0 = (uint32_t)(uint8_t)B64_CHARS[(n >> 18) & 0x3F];
+        uint32_t c1 = (uint32_t)(uint8_t)B64_CHARS[(n >> 12) & 0x3F];
+        uint32_t c2 = (uint32_t)(uint8_t)B64_CHARS[(n >> 6) & 0x3F];
+        uint32_t c3 = (uint32_t)(uint8_t)B64_CHARS[n & 0x3F];
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        uint32_t packed = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+#else
+        uint32_t packed = (c0 << 24) | (c1 << 16) | (c2 << 8) | c3;
+#endif
+        memcpy(out + d, &packed, sizeof(uint32_t));
+        s += 3;
+        d += 4;
+    }
+
+    // Process remaining full 3-byte block safely without out-of-bounds 32-bit read
+    while (s + 3 <= len) {
+        uint32_t n = ((uint32_t)src[s] << 16) | ((uint32_t)src[s + 1] << 8) | (uint32_t)src[s + 2];
+        uint32_t c0 = (uint32_t)(uint8_t)B64_CHARS[(n >> 18) & 0x3F];
+        uint32_t c1 = (uint32_t)(uint8_t)B64_CHARS[(n >> 12) & 0x3F];
+        uint32_t c2 = (uint32_t)(uint8_t)B64_CHARS[(n >> 6) & 0x3F];
+        uint32_t c3 = (uint32_t)(uint8_t)B64_CHARS[n & 0x3F];
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+        uint32_t packed = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+#else
+        uint32_t packed = (c0 << 24) | (c1 << 16) | (c2 << 8) | c3;
+#endif
+        memcpy(out + d, &packed, sizeof(uint32_t));
+        s += 3;
+        d += 4;
+    }
+
+    // Tail remainder: 1 or 2 bytes
+    if (s < len) {
         size_t rem = len - s;
-        uint32_t b0 = src[s++], b1 = (rem > 1) ? src[s++] : 0, b2 = (rem > 2) ? src[s++] : 0;
-        uint32_t t = (b0 << 16) | (b1 << 8) | b2;
-        out[d++] = B64_CHARS[(t >> 18) & 0x3F];
-        out[d++] = B64_CHARS[(t >> 12) & 0x3F];
-        out[d++] = (rem >= 2) ? B64_CHARS[(t >> 6) & 0x3F] : '=';
-        out[d++] = (rem >= 3) ? B64_CHARS[t & 0x3F] : '=';
+        uint32_t b0 = src[s];
+        uint32_t b1 = (rem > 1) ? src[s + 1] : 0;
+        uint32_t n = (b0 << 16) | (b1 << 8);
+        out[d++] = B64_CHARS[(n >> 18) & 0x3F];
+        out[d++] = B64_CHARS[(n >> 12) & 0x3F];
+        out[d++] = (rem > 1) ? B64_CHARS[(n >> 6) & 0x3F] : '=';
+        out[d++] = '=';
     }
     out[d] = '\0';
     if (out_len) *out_len = d;
@@ -88,18 +134,6 @@ static inline void move_cursor(int col, int row) {
     else if (col > 0) printf("\033[%dG", col);
 }
 
-static void get_pix_rgb(const fz_pixmap *pix, int x, int y, uint8_t *r, uint8_t *g, uint8_t *b) {
-    if (x < 0 || x >= pix->w || y < 0 || y >= pix->h || !pix->samples) {
-        *r = *g = *b = 0;
-        return;
-    }
-    const unsigned char *p = pix->samples + ((size_t)y * (size_t)pix->stride) + ((size_t)x * (size_t)pix->n);
-    if (pix->n >= 3) {
-        *r = p[0]; *g = p[1]; *b = p[2];
-    } else {
-        *r = *g = *b = p[0];
-    }
-}
 
 static int sixel_write_cb(char *data, int size, void *priv) {
     return size > 0 ? (int)fwrite(data, 1, (size_t)size, priv ? (FILE *)priv : stdout) : 0;
@@ -117,11 +151,26 @@ static int sixel_write_cb(char *data, int size, void *priv) {
     return ctx;
 }
 
+static sixel_output_t *s_sixel_out = nullptr;
+static sixel_dither_t *s_sixel_dither = nullptr;
+
+static void term_gfx_sixel_cleanup(void) {
+    if (s_sixel_dither) {
+        sixel_dither_unref(s_sixel_dither);
+        s_sixel_dither = nullptr;
+    }
+    if (s_sixel_out) {
+        sixel_output_unref(s_sixel_out);
+        s_sixel_out = nullptr;
+    }
+}
+
 void term_gfx_destroy(term_gfx_context *ctx) {
     if (!ctx) return;
     if (ctx->proto == GFX_KITTY && ctx->last_image_id != 0) {
         term_gfx_kitty_delete_image(ctx->last_image_id);
     }
+    term_gfx_sixel_cleanup();
     free(ctx);
 }
 
@@ -292,19 +341,114 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     if (pix->stride != exp_stride) {
         cbuf = malloc((size_t)pix->w * (size_t)pix->h * (size_t)pix->n);
         if (!cbuf) return false;
-        for (int y = 0; y < pix->h; y++) memcpy(cbuf + (size_t)y * exp_stride, pix->samples + (size_t)y * (size_t)pix->stride, exp_stride);
+        for (int y = 0; y < pix->h; y++) {
+            memcpy(cbuf + (size_t)y * exp_stride, pix->samples + (size_t)y * (size_t)pix->stride, exp_stride);
+        }
         samples = cbuf;
     }
-    sixel_output_t *out = nullptr;
-    sixel_dither_t *dith = nullptr;
-    bool ok = false;
-    if (SIXEL_SUCCEEDED(sixel_output_new(&out, sixel_write_cb, stdout, nullptr)) &&
-        SIXEL_SUCCEEDED(sixel_dither_new(&dith, 256, nullptr)) &&
-        SIXEL_SUCCEEDED(sixel_dither_initialize(dith, (unsigned char *)samples, pix->w, pix->h, fmt, SIXEL_LARGE_AUTO, SIXEL_REP_AUTO, SIXEL_QUALITY_AUTO))) {
-        ok = SIXEL_SUCCEEDED(sixel_encode((unsigned char *)samples, pix->w, pix->h, 0, dith, out));
+
+    if (!s_sixel_out) {
+        if (!SIXEL_SUCCEEDED(sixel_output_new(&s_sixel_out, sixel_write_cb, stdout, nullptr))) {
+            free(cbuf);
+            return false;
+        }
     }
-    if (dith) sixel_dither_unref(dith);
-    if (out) sixel_output_unref(out);
+    if (!s_sixel_dither) {
+        if (!SIXEL_SUCCEEDED(sixel_dither_new(&s_sixel_dither, 256, nullptr))) {
+            free(cbuf);
+            return false;
+        }
+    }
+
+    if (!SIXEL_SUCCEEDED(sixel_dither_initialize(s_sixel_dither, (unsigned char *)samples, pix->w, pix->h, fmt, SIXEL_LARGE_AUTO, SIXEL_REP_AUTO, SIXEL_QUALITY_AUTO))) {
+        free(cbuf);
+        return false;
+    }
+
+    unsigned char *palette = sixel_dither_get_palette(s_sixel_dither);
+    int num_colors = sixel_dither_get_num_of_palette_colors(s_sixel_dither);
+    if (!palette || num_colors <= 0) {
+        bool ok = SIXEL_SUCCEEDED(sixel_encode((unsigned char *)samples, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
+        free(cbuf);
+        fflush(stdout);
+        return ok;
+    }
+
+    unsigned char *indexed = malloc((size_t)pix->w * (size_t)pix->h);
+    if (!indexed) {
+        bool ok = SIXEL_SUCCEEDED(sixel_encode((unsigned char *)samples, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
+        free(cbuf);
+        fflush(stdout);
+        return ok;
+    }
+
+    // Fast color quantization lookup cache (15-bit RGB direct-mapped table, 64KB on stack)
+    uint16_t lut[32768];
+    memset(lut, 0, sizeof(lut));
+
+    // Detect background color at top-left corner (0,0)
+    uint8_t bg_r = samples[0];
+    uint8_t bg_g = (pix->n >= 3) ? samples[1] : samples[0];
+    uint8_t bg_b = (pix->n >= 3) ? samples[2] : samples[0];
+    uint8_t bg_idx = 0;
+    int min_d = INT_MAX;
+    for (int i = 0; i < num_colors; i++) {
+        int dr = (int)bg_r - (int)palette[i * 3];
+        int dg = (int)bg_g - (int)palette[i * 3 + 1];
+        int db = (int)bg_b - (int)palette[i * 3 + 2];
+        int dist = dr * dr + dg * dg + db * db;
+        if (dist < min_d) {
+            min_d = dist;
+            bg_idx = (uint8_t)i;
+            if (dist == 0) break;
+        }
+    }
+    uint16_t bg_key = (uint16_t)((((uint16_t)(bg_r >> 3)) << 10) | (((uint16_t)(bg_g >> 3)) << 5) | ((uint16_t)(bg_b >> 3)));
+    lut[bg_key] = (uint16_t)(0x8000 | bg_idx);
+
+    size_t total_px = (size_t)pix->w * (size_t)pix->h;
+    size_t comp = (size_t)pix->n;
+    for (size_t i = 0; i < total_px; i++) {
+        uint8_t r, g, b;
+        if (comp >= 3) {
+            r = samples[i * comp];
+            g = samples[i * comp + 1];
+            b = samples[i * comp + 2];
+        } else {
+            r = g = b = samples[i * comp];
+        }
+
+        // Fast path: repeated background / margin pixels bypass Floyd-Steinberg diffusion
+        if (r == bg_r && g == bg_g && b == bg_b) {
+            indexed[i] = bg_idx;
+            continue;
+        }
+
+        uint16_t key = (uint16_t)((((uint16_t)(r >> 3)) << 10) | (((uint16_t)(g >> 3)) << 5) | ((uint16_t)(b >> 3)));
+        if (lut[key] & 0x8000) {
+            indexed[i] = (uint8_t)(lut[key] & 0xFF);
+        } else {
+            int best_dist = INT_MAX;
+            uint8_t best_idx = 0;
+            for (int c = 0; c < num_colors; c++) {
+                int dr = (int)r - (int)palette[c * 3];
+                int dg = (int)g - (int)palette[c * 3 + 1];
+                int db = (int)b - (int)palette[c * 3 + 2];
+                int dist = dr * dr + dg * dg + db * db;
+                if (dist < best_dist) {
+                    best_dist = dist;
+                    best_idx = (uint8_t)c;
+                    if (dist == 0) break;
+                }
+            }
+            lut[key] = (uint16_t)(0x8000 | best_idx);
+            indexed[i] = best_idx;
+        }
+    }
+
+    sixel_dither_set_pixelformat(s_sixel_dither, SIXEL_PIXELFORMAT_PAL8);
+    bool ok = SIXEL_SUCCEEDED(sixel_encode(indexed, pix->w, pix->h, 0, s_sixel_dither, s_sixel_out));
+    free(indexed);
     free(cbuf);
     fflush(stdout);
     return ok;
@@ -330,20 +474,87 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     int nr = (pix->h + 1) / 2;
     if (max_rows > 0 && nr > max_rows) nr = max_rows;
     if (nc <= 0 || nr <= 0) return false;
-    for (int cy = 0; cy < nr; cy++) {
-        move_cursor(col > 0 ? col : 1, row > 0 ? row + cy : cy + 1);
-        for (int cx = 0; cx < nc; cx++) {
-            int px = (int)((int64_t)cx * pix->w / nc);
-            int py_t = (int)((int64_t)(cy * 2) * pix->h / (nr * 2));
-            int py_b = (int)((int64_t)(cy * 2 + 1) * pix->h / (nr * 2));
-            if (py_b >= pix->h) py_b = pix->h - 1;
-            uint8_t tr = 0, tg = 0, tb = 0, br = 0, bg = 0, bb = 0;
-            get_pix_rgb(pix, px, py_t, &tr, &tg, &tb);
-            get_pix_rgb(pix, px, py_b, &br, &bg, &bb);
-            printf("\033[38;2;%u;%u;%um\033[48;2;%u;%u;%um▀", tr, tg, tb, br, bg, bb);
-        }
-        printf("\033[0m\n");
+
+    int *px_map = (int *)malloc((size_t)nc * sizeof(int));
+    if (!px_map) return false;
+    for (int cx = 0; cx < nc; cx++) {
+        px_map[cx] = (int)((int64_t)cx * pix->w / nc);
     }
+
+    // Row buffer: each cell takes at most ~40 bytes when colors change, or 3 bytes (▀) when colors repeat.
+    // Plus cursor move and reset escape sequences.
+    size_t buf_cap = (size_t)nc * 48 + 512;
+    char *line_buf = (char *)malloc(buf_cap);
+    if (!line_buf) {
+        free(px_map);
+        return false;
+    }
+
+    for (int cy = 0; cy < nr; cy++) {
+        int py_t = (int)((int64_t)(cy * 2) * pix->h / (nr * 2));
+        int py_b = (int)((int64_t)(cy * 2 + 1) * pix->h / (nr * 2));
+        if (py_b >= pix->h) py_b = pix->h - 1;
+
+        const unsigned char *row_t = pix->samples + ((size_t)py_t * (size_t)pix->stride);
+        const unsigned char *row_b = pix->samples + ((size_t)py_b * (size_t)pix->stride);
+
+        int cur_col = col > 0 ? col : 1;
+        int cur_row = row > 0 ? row + cy : cy + 1;
+
+        size_t len = 0;
+        if (cur_row > 0 && cur_col > 0) {
+            len += (size_t)snprintf(line_buf + len, buf_cap - len, "\033[%d;%dH", cur_row, cur_col);
+        } else if (cur_col > 0) {
+            len += (size_t)snprintf(line_buf + len, buf_cap - len, "\033[%dG", cur_col);
+        }
+
+        uint32_t cur_fg = 0xFFFFFFFF; // Invalid 24-bit RGB sentinel
+        uint32_t cur_bg = 0xFFFFFFFF;
+
+        for (int cx = 0; cx < nc; cx++) {
+            int px = px_map[cx];
+            uint8_t tr, tg, tb, br, bg, bb;
+            if (pix->n >= 3) {
+                size_t off = (size_t)px * (size_t)pix->n;
+                tr = row_t[off];     tg = row_t[off + 1]; tb = row_t[off + 2];
+                br = row_b[off];     bg = row_b[off + 1]; bb = row_b[off + 2];
+            } else {
+                size_t off = (size_t)px * (size_t)pix->n;
+                tr = tg = tb = row_t[off];
+                br = bg = bb = row_b[off];
+            }
+
+            uint32_t fg = ((uint32_t)tr << 16) | ((uint32_t)tg << 8) | tb;
+            uint32_t bg_val = ((uint32_t)br << 16) | ((uint32_t)bg << 8) | bb;
+
+            // Only emit foreground RGB escape sequence if color actually changed
+            if (fg != cur_fg) {
+                len += (size_t)snprintf(line_buf + len, buf_cap - len, "\033[38;2;%u;%u;%um", (unsigned int)tr, (unsigned int)tg, (unsigned int)tb);
+                cur_fg = fg;
+            }
+            // Only emit background RGB escape sequence if color actually changed
+            if (bg_val != cur_bg) {
+                len += (size_t)snprintf(line_buf + len, buf_cap - len, "\033[48;2;%u;%u;%um", (unsigned int)br, (unsigned int)bg, (unsigned int)bb);
+                cur_bg = bg_val;
+            }
+            // Emit Unicode upper half block ▀ (UTF-8: 0xE2 0x96 0x80)
+            if (len + 3 < buf_cap) {
+                line_buf[len++] = (char)0xE2;
+                line_buf[len++] = (char)0x96;
+                line_buf[len++] = (char)0x80;
+            }
+        }
+
+        // Reset attributes at end of row
+        if (len + 6 < buf_cap) {
+            memcpy(line_buf + len, "\033[0m\n", 5);
+            len += 5;
+        }
+        fwrite(line_buf, 1, len, stdout);
+    }
+
+    free(line_buf);
+    free(px_map);
     fflush(stdout);
     return true;
 }

@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct file_entry {
     char *path;
@@ -13,6 +14,8 @@ typedef struct file_list {
     file_entry *entries;
     size_t count;
     size_t capacity;
+    uint32_t *ht;
+    size_t ht_capacity;
 } file_list;
 
 // Checks whether the file extension is supported:

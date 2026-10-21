@@ -2,17 +2,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <pthread.h>
 #if defined(__linux__)
 #include <malloc.h>
 #endif
 
+#define CACHE_BUCKET_COUNT 128
+#define CACHE_BUCKET_MASK (CACHE_BUCKET_COUNT - 1)
+
 struct cache_node {
     char *key;
+    uint64_t hash;
     char *png_path;
     fz_pixmap *pix;
     struct cache_node *prev;
     struct cache_node *next;
+    struct cache_node *hash_prev;
+    struct cache_node *hash_next;
 };
 
 struct page_cache {
@@ -20,8 +28,24 @@ struct page_cache {
     size_t count;
     struct cache_node *head;
     struct cache_node *tail;
+    struct cache_node *buckets[CACHE_BUCKET_COUNT];
     pthread_mutex_t lock;
 };
+
+// Fast 64-bit FNV-1a hash with Murmur3 finalizer mixer
+static inline uint64_t hash_str(const char *str) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
+        hash ^= (uint64_t)(*p);
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= hash >> 33;
+    return hash;
+}
 
 [[nodiscard]] page_cache *cache_create(size_t max_entries) {
     page_cache *c = calloc(1, sizeof(page_cache));
@@ -31,18 +55,70 @@ struct page_cache {
     return c;
 }
 
-static void remove_node(page_cache *c, struct cache_node *n) {
-    if (n->prev) n->prev->next = n->next; else c->head = n->next;
-    if (n->next) n->next->prev = n->prev; else c->tail = n->prev;
-    n->prev = n->next = nullptr;
+static void remove_lru_node(page_cache *c, struct cache_node *n) {
+    if (n->prev) n->prev->next = n->next;
+    else c->head = n->next;
+
+    if (n->next) n->next->prev = n->prev;
+    else c->tail = n->prev;
+
+    n->prev = nullptr;
+    n->next = nullptr;
 }
 
-static void push_front(page_cache *c, struct cache_node *n) {
+static void push_lru_front(page_cache *c, struct cache_node *n) {
     n->next = c->head;
     n->prev = nullptr;
-    if (c->head) c->head->prev = n;
+    if (c->head) {
+        c->head->prev = n;
+    }
     c->head = n;
-    if (!c->tail) c->tail = n;
+    if (!c->tail) {
+        c->tail = n;
+    }
+}
+
+static void hash_insert(page_cache *c, struct cache_node *n) {
+    size_t b = (size_t)(n->hash & CACHE_BUCKET_MASK);
+    n->hash_prev = nullptr;
+    n->hash_next = c->buckets[b];
+    if (c->buckets[b]) {
+        c->buckets[b]->hash_prev = n;
+    }
+    c->buckets[b] = n;
+}
+
+static void hash_remove(page_cache *c, struct cache_node *n) {
+    size_t b = (size_t)(n->hash & CACHE_BUCKET_MASK);
+    if (n->hash_prev) {
+        n->hash_prev->hash_next = n->hash_next;
+    } else {
+        c->buckets[b] = n->hash_next;
+    }
+    if (n->hash_next) {
+        n->hash_next->hash_prev = n->hash_prev;
+    }
+    n->hash_prev = nullptr;
+    n->hash_next = nullptr;
+}
+
+static struct cache_node *hash_lookup(page_cache *c, const char *key, uint64_t hash) {
+    size_t b = (size_t)(hash & CACHE_BUCKET_MASK);
+    for (struct cache_node *curr = c->buckets[b]; curr; curr = curr->hash_next) {
+        if (curr->hash == hash && strcmp(curr->key, key) == 0) {
+            return curr;
+        }
+    }
+    return nullptr;
+}
+
+static struct cache_node *find_and_promote(page_cache *c, const char *key, uint64_t hash) {
+    struct cache_node *n = hash_lookup(c, key, hash);
+    if (n && n != c->head) {
+        remove_lru_node(c, n);
+        push_lru_front(c, n);
+    }
+    return n;
 }
 
 static void free_node(fz_context *ctx, struct cache_node *n) {
@@ -61,6 +137,7 @@ void cache_clear(page_cache *c, fz_context *ctx) {
         free_node(ctx, n);
     }
     c->head = c->tail = nullptr;
+    memset(c->buckets, 0, sizeof(c->buckets));
     c->count = 0;
 #if defined(__linux__)
     malloc_trim(0);
@@ -75,32 +152,31 @@ void cache_destroy(page_cache *c, fz_context *ctx) {
     free(c);
 }
 
-static struct cache_node *find_and_promote(page_cache *c, const char *key) {
-    for (struct cache_node *curr = c->head; curr; curr = curr->next) {
-        if (strcmp(curr->key, key) == 0) {
-            if (curr != c->head) {
-                remove_node(c, curr);
-                push_front(c, curr);
-            }
-            return curr;
-        }
-    }
-    return nullptr;
-}
-
 [[nodiscard]] fz_pixmap *cache_get(page_cache *c, fz_context *ctx, const char *key) {
     if (!c || !key) return nullptr;
+    uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
-    struct cache_node *n = find_and_promote(c, key);
+    struct cache_node *n = find_and_promote(c, key, hash);
     fz_pixmap *ret = (n && n->pix && ctx) ? fz_keep_pixmap(ctx, n->pix) : nullptr;
+    pthread_mutex_unlock(&c->lock);
+    return ret;
+}
+
+[[nodiscard]] bool cache_contains(page_cache *c, const char *key) {
+    if (!c || !key) return false;
+    uint64_t hash = hash_str(key);
+    pthread_mutex_lock(&c->lock);
+    struct cache_node *n = hash_lookup(c, key, hash);
+    bool ret = (n != nullptr);
     pthread_mutex_unlock(&c->lock);
     return ret;
 }
 
 [[nodiscard]] const char *cache_get_png_path(page_cache *c, const char *key) {
     if (!c || !key) return nullptr;
+    uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
-    struct cache_node *n = find_and_promote(c, key);
+    struct cache_node *n = find_and_promote(c, key, hash);
     const char *ret = n ? n->png_path : nullptr;
     pthread_mutex_unlock(&c->lock);
     return ret;
@@ -108,8 +184,9 @@ static struct cache_node *find_and_promote(page_cache *c, const char *key) {
 
 void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, const char *png_path) {
     if (!c || !key) return;
+    uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
-    struct cache_node *n = find_and_promote(c, key);
+    struct cache_node *n = find_and_promote(c, key, hash);
     if (n) {
         if (n->pix && ctx) fz_drop_pixmap(ctx, n->pix);
         n->pix = (pix && ctx) ? fz_keep_pixmap(ctx, pix) : nullptr;
@@ -120,7 +197,8 @@ void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, 
     }
     if (c->count >= c->max_entries && c->tail) {
         struct cache_node *old = c->tail;
-        remove_node(c, old);
+        remove_lru_node(c, old);
+        hash_remove(c, old);
         free_node(ctx, old);
         c->count--;
 #if defined(__linux__)
@@ -133,9 +211,16 @@ void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, 
         return;
     }
     n->key = strdup(key);
+    if (!n->key) {
+        free(n);
+        pthread_mutex_unlock(&c->lock);
+        return;
+    }
+    n->hash = hash;
     n->pix = (pix && ctx) ? fz_keep_pixmap(ctx, pix) : nullptr;
     n->png_path = png_path ? strdup(png_path) : nullptr;
-    push_front(c, n);
+    push_lru_front(c, n);
+    hash_insert(c, n);
     c->count++;
     pthread_mutex_unlock(&c->lock);
 }

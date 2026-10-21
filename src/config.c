@@ -9,11 +9,46 @@
 
 static void path_hash_hex(const char *path, char out[33]) {
     uint64_t h1 = 0xcbf29ce484222325ULL, h2 = 0x100000001b3ULL;
-    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
-        h1 = (h1 ^ *p) * 0x100000001b3ULL;
-        h2 = (h2 ^ (*p + 0x5a)) * 0xcbf29ce484222325ULL;
+    const uint64_t prime1 = 0x100000001b3ULL;
+    const uint64_t prime2 = 0xcbf29ce484222325ULL;
+    const unsigned char *p = (const unsigned char *)path;
+    size_t len = strlen(path);
+
+    while (len >= 8) {
+        h1 = (h1 ^ p[0]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[0] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[1]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[1] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[2]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[2] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[3]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[3] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[4]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[4] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[5]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[5] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[6]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[6] + 0x5a)) * prime2;
+        h1 = (h1 ^ p[7]) * prime1;
+        h2 = (h2 ^ (uint8_t)(p[7] + 0x5a)) * prime2;
+        p += 8;
+        len -= 8;
     }
-    snprintf(out, 33, "%016lx%016lx", (unsigned long)h1, (unsigned long)h2);
+    while (len > 0) {
+        h1 = (h1 ^ *p) * prime1;
+        h2 = (h2 ^ (uint8_t)(*p + 0x5a)) * prime2;
+        p++;
+        len--;
+    }
+
+    static const char hex_chars[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--) {
+        out[i] = hex_chars[h1 & 0x0F];
+        h1 >>= 4;
+        out[i + 16] = hex_chars[h2 & 0x0F];
+        h2 >>= 4;
+    }
+    out[32] = '\0';
 }
 
 static void get_cfg_path(const char *doc_path, char *out, size_t sz) {

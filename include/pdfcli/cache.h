@@ -14,6 +14,9 @@ void cache_destroy(page_cache *cache, fz_context *ctx);
 // Lookup a cached pixmap. If found, returns a retained fz_pixmap* (caller must fz_drop_pixmap when done)
 [[nodiscard]] fz_pixmap *cache_get(page_cache *cache, fz_context *ctx, const char *key);
 
+// Fast O(1) check if a key is present in cache without retaining a pixmap reference
+[[nodiscard]] bool cache_contains(page_cache *cache, const char *key);
+
 // Store a pixmap into cache. Cache retains a reference.
 void cache_put(page_cache *cache, fz_context *ctx, const char *key, fz_pixmap *pix, const char *png_path);
 
