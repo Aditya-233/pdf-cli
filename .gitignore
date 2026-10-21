@@ -3,3 +3,6 @@ pdf-cli
 dvctl
 build/
 *.o
+depends/dvtm/
+depends/libtermkey/
+depends/termbox2/
