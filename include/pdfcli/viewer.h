@@ -27,6 +27,7 @@ void viewer_prev_tab(doc_viewer *v);
 void viewer_toggle_hud(doc_viewer *v);
 void viewer_dismiss_hud(doc_viewer *v);
 void viewer_render_tab_bar(doc_viewer *v);
+void viewer_set_term_size(doc_viewer *v, int cols, int rows);
 [[nodiscard]] int viewer_find_tab_hit(const doc_viewer *v, int col, int row, bool *out_is_close);
 
 // Runs the main interactive viewer loop.

@@ -178,9 +178,10 @@ void viewer_toggle_hud(doc_viewer *v) {
     } else {
         uint64_t now = get_time_ms();
         v->tab_bar_until_ms = now + 2500;
+        if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
         viewer_tab *tab = &v->tabs[v->active_tab_idx];
         char ibuf[256];
-        int curr_p = (tab->content_pages && tab->current_page_idx < (int)tab->content_page_count) ? tab->content_pages[tab->current_page_idx] + 1 : 1;
+        int curr_p = (tab->content_pages && tab->current_page_idx >= 0 && tab->current_page_idx < (int)tab->content_page_count) ? tab->content_pages[tab->current_page_idx] + 1 : 1;
         snprintf(ibuf, sizeof(ibuf), "[%zu/%zu] %s | Page %d/%zu (%d) | Zoom %.0f%% | Fit %s",
                  v->active_tab_idx + 1, v->tab_count, tab->display_name ? tab->display_name : "doc",
                  tab->current_page_idx + 1, tab->content_page_count, curr_p,
@@ -435,22 +436,22 @@ static void viewer_tab_free(viewer_tab *tab) {
 
 static void viewer_display_current_page(doc_viewer *v);
 
-static void format_tab_title(char *out, size_t out_sz, const char *name, int max_w) {
+static void truncate_to_display_width(char *out, size_t out_sz, const char *src, int max_w, bool ellipsis) {
     if (!out || out_sz == 0) return;
-    if (!name) {
-        snprintf(out, out_sz, "doc");
+    if (!src) {
+        out[0] = '\0';
         return;
     }
-    int total_w = str_display_width(name);
+    int total_w = str_display_width(src);
     if (total_w <= max_w) {
-        snprintf(out, out_sz, "%s", name);
+        snprintf(out, out_sz, "%s", src);
         return;
     }
-    int target_w = max_w - 3;
+    int target_w = (ellipsis && max_w > 3) ? (max_w - 3) : max_w;
     if (target_w < 1) target_w = 1;
     size_t byte_idx = 0;
     int cur_w = 0;
-    const char *p = name;
+    const char *p = src;
     while (*p && cur_w < target_w) {
         uint32_t cp = 0;
         size_t len = 0;
@@ -469,15 +470,27 @@ static void format_tab_title(char *out, size_t out_sz, const char *name, int max
         byte_idx += len;
     }
     if (byte_idx >= out_sz) byte_idx = out_sz - 1;
-    memcpy(out, name, byte_idx);
+    memcpy(out, src, byte_idx);
     out[byte_idx] = '\0';
-    snprintf(out + byte_idx, out_sz - byte_idx, "...");
+    if (ellipsis && max_w > 3) {
+        snprintf(out + byte_idx, out_sz - byte_idx, "...");
+    }
+}
+
+static void format_tab_title(char *out, size_t out_sz, const char *name, int max_w) {
+    truncate_to_display_width(out, out_sz, name ? name : "doc", max_w, true);
 }
 
 void viewer_render_tab_bar(doc_viewer *v) {
     PROFILE_SCOPE("viewer", "viewer_render_tabs");
     if (!v || v->tab_count == 0) return;
     if (v->term_cols <= 0) v->term_cols = 80;
+    if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
+
+    memset(v->hit_boxes, 0, sizeof(v->hit_boxes));
+    for (size_t i = 0; i < MAX_TABS; i++) {
+        v->hit_boxes[i].close_col = -1;
+    }
 
     printf("\033[1;1H\033[K");
     int cur_col = 1;
@@ -490,16 +503,15 @@ void viewer_render_tab_bar(doc_viewer *v) {
         format_tab_title(title, sizeof(title), name, 14);
         int title_w = str_display_width(title);
 
-        v->hit_boxes[i].start_col = cur_col;
         int tab_num = (i == 9) ? 0 : (int)(i + 1);
 
         int len = 0;
         if (is_active) {
             len = 4 + title_w + 3; // " %d: %s × "
             if (cur_col >= v->term_cols || cur_col + len - 1 > v->term_cols) {
-                v->hit_boxes[i] = (tab_hit_box){0, 0, -1};
                 break;
             }
+            v->hit_boxes[i].start_col = cur_col;
             printf("\033[1;37;44m %d: %s \033[1;31;44m×\033[1;37;44m \033[0m", tab_num, title);
             v->hit_boxes[i].close_col = cur_col + len - 2; // Exact column of '×'
             v->hit_boxes[i].end_col = cur_col + len - 1;
@@ -507,9 +519,9 @@ void viewer_render_tab_bar(doc_viewer *v) {
         } else {
             len = 4 + title_w + 1; // " %d: %s "
             if (cur_col >= v->term_cols || cur_col + len - 1 > v->term_cols) {
-                v->hit_boxes[i] = (tab_hit_box){0, 0, -1};
                 break;
             }
+            v->hit_boxes[i].start_col = cur_col;
             printf("\033[38;5;248;48;5;236m %d: %s \033[0m", tab_num, title);
             v->hit_boxes[i].close_col = -1;
             v->hit_boxes[i].end_col = cur_col + len - 1;
@@ -521,20 +533,25 @@ void viewer_render_tab_bar(doc_viewer *v) {
             cur_col++;
         }
     }
-    for (size_t i = v->tab_count; i < MAX_TABS; i++) {
-        v->hit_boxes[i] = (tab_hit_box){0, 0, -1};
-    }
     if (cur_col <= v->term_cols) {
         printf("\033[48;5;234m\033[1;%dH\033[K\033[0m", cur_col);
     }
 }
 
+void viewer_set_term_size(doc_viewer *v, int cols, int rows) {
+    if (!v) return;
+    if (cols > 0) v->term_cols = cols;
+    if (rows > 0) v->term_rows = rows;
+}
+
 [[nodiscard]] int viewer_find_tab_hit(const doc_viewer *v, int col, int row, bool *out_is_close) {
     if (out_is_close) *out_is_close = false;
     if (!v || v->tab_count == 0 || !viewer_is_tab_bar_visible(v)) return -1;
-    if (row != 1) return -1;
+    if (row != 1 || col < 1 || (v->term_cols > 0 && col > v->term_cols)) return -1;
     for (size_t i = 0; i < v->tab_count; i++) {
-        if (col >= v->hit_boxes[i].start_col && col <= v->hit_boxes[i].end_col) {
+        if (v->hit_boxes[i].start_col > 0 &&
+            col >= v->hit_boxes[i].start_col &&
+            col <= v->hit_boxes[i].end_col) {
             if (v->hit_boxes[i].close_col > 0 &&
                 col >= v->hit_boxes[i].close_col - 1 &&
                 col <= v->hit_boxes[i].end_col) {
@@ -550,6 +567,7 @@ static void viewer_display_current_page(doc_viewer *v) {
     PROFILE_SCOPE("viewer", "viewer_render");
     profile_record_frame();
     if (!v || v->tab_count == 0) return;
+    if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
 
     term_get_size(&v->term_cols, &v->term_rows);
@@ -701,8 +719,10 @@ static void viewer_display_current_page(doc_viewer *v) {
     if (tab->current_links) { doc_free_page_links(tab->current_links, tab->current_links_count); tab->current_links = nullptr; }
     tab->current_links = doc_get_page_links(tab->doc, current_doc_page, &tab->current_links_count);
 
-    if (get_time_ms() < v->status_until_ms && v->status_msg[0]) {
-        printf("\033[%d;1H\033[7m %s \033[0m", v->term_rows, v->status_msg);
+    if (get_time_ms() < v->status_until_ms && v->status_msg[0] && v->term_cols > 2) {
+        char disp_status[256];
+        truncate_to_display_width(disp_status, sizeof(disp_status), v->status_msg, v->term_cols - 2, true);
+        printf("\033[%d;1H\033[7m %s \033[0m\033[K", v->term_rows, disp_status);
     }
     term_end_sync();
 #if defined(__linux__)
@@ -812,7 +832,7 @@ static bool viewer_handle_link_click(doc_viewer *v, int col, int row) {
     v->active_tab_idx = idx;
     term_set_title(v->tabs[idx].file_path);
     char msg[128];
-    snprintf(msg, sizeof(msg), "Opened Tab %zu: %s", v->tab_count, v->tabs[idx].display_name);
+    snprintf(msg, sizeof(msg), "Opened Tab %zu: %s", v->tab_count, v->tabs[idx].display_name ? v->tabs[idx].display_name : "doc");
     viewer_set_status(v, msg, 1500);
     return true;
 }
@@ -826,10 +846,10 @@ void viewer_switch_tab(doc_viewer *v, size_t index) {
     v->active_tab_idx = index;
     term_set_title(v->tabs[v->active_tab_idx].file_path);
     char msg[128];
-    snprintf(msg, sizeof(msg), "Tab %zu/%zu: %s", index + 1, v->tab_count, v->tabs[index].display_name);
+    snprintf(msg, sizeof(msg), "Tab %zu/%zu: %s", index + 1, v->tab_count, v->tabs[index].display_name ? v->tabs[index].display_name : "doc");
     viewer_set_status(v, msg, 1000);
     term_log_keystroke("TAB SWITCH: from tab %zu to tab %zu (\"%s\", %zu pages)",
-                       old_idx + 1, index + 1, v->tabs[index].display_name, v->tabs[index].content_page_count);
+                       old_idx + 1, index + 1, v->tabs[index].display_name ? v->tabs[index].display_name : "doc", v->tabs[index].content_page_count);
     viewer_display_current_page(v);
 }
 
@@ -1295,6 +1315,7 @@ static void viewer_show_help(doc_viewer *v) {
                     break;
                 }
             } else if (key == KEY_CTRL_T) {
+                viewer_dismiss_hud(v);
                 term_log_keystroke("ACTION: Ctrl+T pressed -> Open new tab file picker");
                 if (v->tab_count >= MAX_TABS) {
                     viewer_set_status(v, "Tab limit reached (max 10 tabs)", 1500);

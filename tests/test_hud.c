@@ -265,7 +265,126 @@ int main(void) {
         }
     }
     assert(found_active_close);
+    mute_stdout();
+    viewer_close_tab(v, 2);
+    unmute_stdout();
+    viewer_dismiss_hud(v);
     unlink(doc_utf8_path);
+    printf(" PASSED\n");
+
+    // Test 11: Stale hit box invalidation when terminal is resized narrower
+    printf("  [TEST] Stale hit box invalidation on terminal width shrinking...");
+    fflush(stdout);
+    const char *doc3_path = "/tmp/test_hud_doc3.pdf";
+    create_test_pdf(doc3_path);
+    mute_stdout();
+    assert(viewer_add_tab(v, doc3_path));
+    unmute_stdout();
+    assert(viewer_get_tab_count(v) == 3);
+
+    viewer_set_term_size(v, 80, 24);
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // At 80 cols, Tab 0, Tab 1, and Tab 2 all fit and have valid hit boxes
+    bool has_tab0 = false, has_tab1 = false, has_tab2 = false;
+    for (int c = 1; c <= 80; c++) {
+        int h = viewer_find_tab_hit(v, c, 1, &is_close);
+        if (h == 0) has_tab0 = true;
+        if (h == 1) has_tab1 = true;
+        if (h == 2) has_tab2 = true;
+    }
+    assert(has_tab0 && has_tab1 && has_tab2);
+
+    // Now shrink terminal width to 25 cols (only Tab 0 fits, Tab 1 & Tab 2 overflow)
+    viewer_set_term_size(v, 25, 24);
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // Must NOT retain stale hit boxes for Tab 1 or Tab 2!
+    for (int c = 1; c <= 80; c++) {
+        int h = viewer_find_tab_hit(v, c, 1, &is_close);
+        assert(h != 1); // Tab 1 must NOT be hit anywhere!
+        assert(h != 2); // Tab 2 must NOT be hit anywhere!
+    }
+    viewer_dismiss_hud(v);
+    unlink(doc3_path);
+    printf(" PASSED\n");
+
+    // Test 12: Column boundary safety & zeroed hit box protection
+    printf("  [TEST] Column boundary safety & zeroed hit box protection...");
+    fflush(stdout);
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+    viewer_set_term_size(v, 80, 24);
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // Out-of-bounds columns and zeroed hit boxes must return -1
+    assert(viewer_find_tab_hit(v, 0, 1, &is_close) == -1);  // Col 0
+    assert(viewer_find_tab_hit(v, -1, 1, &is_close) == -1); // Negative col
+    assert(viewer_find_tab_hit(v, -99, 1, &is_close) == -1);
+    assert(viewer_find_tab_hit(v, 81, 1, &is_close) == -1); // Past term_cols
+    assert(viewer_find_tab_hit(v, 200, 1, &is_close) == -1);
+    assert(viewer_find_tab_hit(v, 10, 0, &is_close) == -1); // Row 0
+    assert(viewer_find_tab_hit(v, 10, 2, &is_close) == -1); // Row 2
+    assert(viewer_find_tab_hit(v, 10, 24, &is_close) == -1); // Bottom row
+
+    viewer_dismiss_hud(v);
+    printf(" PASSED\n");
+
+    // Test 13: Tab switching and Option A navigation
+    printf("  [TEST] Tab switching and active tab state...");
+    fflush(stdout);
+    assert(viewer_get_tab_count(v) == 3);
+    mute_stdout();
+    viewer_switch_tab(v, 0);
+    assert(viewer_get_active_tab(v) == 0);
+    viewer_switch_tab(v, 1);
+    assert(viewer_get_active_tab(v) == 1);
+    viewer_switch_tab(v, 2);
+    assert(viewer_get_active_tab(v) == 2);
+    unmute_stdout();
+    assert(!viewer_is_tab_bar_visible(v)); // Switching tabs does not force HUD open
+    printf(" PASSED\n");
+
+    // Test 14: Single-tab close via hit box
+    printf("  [TEST] Single-tab close via hit-box click...");
+    fflush(stdout);
+    mute_stdout();
+    viewer_close_tab(v, 2);
+    viewer_close_tab(v, 1);
+    unmute_stdout();
+    assert(viewer_get_tab_count(v) == 1);
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // Find the close button for Tab 0 and click it
+    int close_col = -1;
+    for (int c = 1; c <= 80; c++) {
+        if (viewer_find_tab_hit(v, c, 1, &is_close) == 0 && is_close) {
+            close_col = c;
+            break;
+        }
+    }
+    assert(close_col > 0);
+    int clicked_tab = viewer_find_tab_hit(v, close_col, 1, &is_close);
+    assert(clicked_tab == 0 && is_close);
+    mute_stdout();
+    viewer_close_tab(v, (size_t)clicked_tab);
+    unmute_stdout();
+    assert(viewer_get_tab_count(v) == 0);
+    assert(!viewer_is_tab_bar_visible(v));
     printf(" PASSED\n");
 
     viewer_destroy(v);
