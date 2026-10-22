@@ -436,45 +436,64 @@ static void viewer_tab_free(viewer_tab *tab) {
 
 static void viewer_display_current_page(doc_viewer *v);
 
-static void truncate_to_display_width(char *out, size_t out_sz, const char *src, int max_w, bool ellipsis) {
+void viewer_truncate_to_display_width(char *out, size_t out_sz, const char *src, int max_w, bool ellipsis) {
     if (!out || out_sz == 0) return;
-    if (!src) {
-        out[0] = '\0';
-        return;
-    }
+    out[0] = '\0';
+    if (!src || max_w <= 0) return;
+
     int total_w = str_display_width(src);
-    if (total_w <= max_w) {
-        snprintf(out, out_sz, "%s", src);
-        return;
-    }
-    int target_w = (ellipsis && max_w > 3) ? (max_w - 3) : max_w;
+    bool needs_trunc = (total_w > max_w);
+    int target_w = (needs_trunc && ellipsis && max_w > 3) ? (max_w - 3) : max_w;
     if (target_w < 1) target_w = 1;
-    size_t byte_idx = 0;
+
+    size_t max_bytes = (needs_trunc && ellipsis && max_w > 3)
+                       ? (out_sz >= 4 ? out_sz - 4 : 0)
+                       : (out_sz >= 1 ? out_sz - 1 : 0);
+
+    size_t out_len = 0;
     int cur_w = 0;
     const char *p = src;
+
     while (*p && cur_w < target_w) {
         uint32_t cp = 0;
         size_t len = 0;
         if (utf8_decode(p, &cp, &len) < 0 || len == 0) {
-            if (cur_w + 1 > target_w) break;
+            // Invalid UTF-8 byte: sanitize to space ' ' (width 1)
+            if (cur_w + 1 > target_w || out_len + 1 > max_bytes) break;
+            out[out_len++] = ' ';
             cur_w += 1;
             p += 1;
-            byte_idx += 1;
             continue;
         }
+
+        // Sanitize control characters (\r, \n, \t, escape sequences, C0/C1 controls)
+        if (cp < 0x20 || (cp >= 0x7F && cp < 0xA0)) {
+            if (cur_w + 1 > target_w || out_len + 1 > max_bytes) break;
+            out[out_len++] = ' ';
+            cur_w += 1;
+            p += len;
+            continue;
+        }
+
         int w = utf8_width(cp);
         if (w < 0) w = 1;
-        if (cur_w + w > target_w) break;
+        if (cur_w + w > target_w || out_len + len > max_bytes) break;
+
+        memcpy(out + out_len, p, len);
+        out_len += len;
         cur_w += w;
         p += len;
-        byte_idx += len;
     }
-    if (byte_idx >= out_sz) byte_idx = out_sz - 1;
-    memcpy(out, src, byte_idx);
-    out[byte_idx] = '\0';
-    if (ellipsis && max_w > 3) {
-        snprintf(out + byte_idx, out_sz - byte_idx, "...");
+
+    if (needs_trunc && ellipsis && max_w > 3 && out_sz - out_len >= 4) {
+        memcpy(out + out_len, "...", 3);
+        out_len += 3;
     }
+    out[out_len] = '\0';
+}
+
+static void truncate_to_display_width(char *out, size_t out_sz, const char *src, int max_w, bool ellipsis) {
+    viewer_truncate_to_display_width(out, out_sz, src, max_w, ellipsis);
 }
 
 static void format_tab_title(char *out, size_t out_sz, const char *name, int max_w) {
@@ -536,6 +555,7 @@ void viewer_render_tab_bar(doc_viewer *v) {
     if (cur_col <= v->term_cols) {
         printf("\033[48;5;234m\033[1;%dH\033[K\033[0m", cur_col);
     }
+    fflush(stdout);
 }
 
 void viewer_set_term_size(doc_viewer *v, int cols, int rows) {
@@ -719,7 +739,7 @@ static void viewer_display_current_page(doc_viewer *v) {
     if (tab->current_links) { doc_free_page_links(tab->current_links, tab->current_links_count); tab->current_links = nullptr; }
     tab->current_links = doc_get_page_links(tab->doc, current_doc_page, &tab->current_links_count);
 
-    if (get_time_ms() < v->status_until_ms && v->status_msg[0] && v->term_cols > 2) {
+    if (get_time_ms() < v->status_until_ms && v->status_msg[0] && v->term_cols > 2 && v->term_rows > 1) {
         char disp_status[256];
         truncate_to_display_width(disp_status, sizeof(disp_status), v->status_msg, v->term_cols - 2, true);
         printf("\033[%d;1H\033[7m %s \033[0m\033[K", v->term_rows, disp_status);
@@ -733,6 +753,7 @@ static void viewer_display_current_page(doc_viewer *v) {
 static void viewer_goto_page(doc_viewer *v, int page_idx) {
     if (v->tab_count == 0) return;
     viewer_dismiss_hud(v);
+    if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
     if (page_idx < 0) page_idx = 0;
     if (page_idx >= (int)tab->content_page_count) page_idx = (int)tab->content_page_count - 1;
@@ -746,6 +767,7 @@ static void viewer_goto_page(doc_viewer *v, int page_idx) {
 
 static bool viewer_handle_link_click(doc_viewer *v, int col, int row) {
     if (v->tab_count == 0) return false;
+    if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
     if (!tab->current_links || tab->current_links_count == 0) return false;
     if (col < tab->click_map.col_offset || col >= tab->click_map.col_offset + tab->click_map.width_chars ||
@@ -939,6 +961,7 @@ static void viewer_handle_ipc(doc_viewer *v) {
         free(r);
         return;
     }
+    if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
 
     if (!strcmp(cmd, "status")) {
@@ -1097,8 +1120,8 @@ static void viewer_show_help(doc_viewer *v) {
     printf("\033[%d;6H\033[1mMouse Wheel on Tab Bar\033[0m       Cycle through tabs\033[K\r\n", r++);
     r++;
     printf("\033[%d;4H\033[1;33mPage Navigation\033[0m\033[K\r\n", r++);
-    printf("\033[%d;6H\033[1mRight\033[0m / \033[1mj\033[0m / \033[1mJ\033[0m       Next page\033[K\r\n", r++);
-    printf("\033[%d;6H\033[1mLeft\033[0m  / \033[1mk\033[0m / \033[1mK\033[0m       Previous page\033[K\r\n", r++);
+    printf("\033[%d;6H\033[1mRight\033[0m / \033[1mn\033[0m / \033[1mN\033[0m       Next page\033[K\r\n", r++);
+    printf("\033[%d;6H\033[1mLeft\033[0m  / \033[1mp\033[0m / \033[1mP\033[0m       Previous page\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mg\033[0m                       Go to specific PDF page number\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mT\033[0m                       Table of contents modal (fuzzy search, Enter jumps)\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mb\033[0m                       Back to file picker\033[K\r\n", r++);
@@ -1107,7 +1130,8 @@ static void viewer_show_help(doc_viewer *v) {
     printf("\033[%d;6H\033[1mPgDn\033[0m / \033[1mSpace\033[0m           Smooth continuous scroll down (~35%% screen, overlap)\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mPgUp\033[0m                    Smooth continuous scroll up (~35%% screen, overlap)\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mWheelDown\033[0m / \033[1mWheelUp\033[0m   Mouse wheel smooth scroll\033[K\r\n", r++);
-    printf("\033[%d;6H\033[1mDown\033[0m / \033[1mUp\033[0m             Fine scroll (fit-width) / Page (fit-height)\033[K\r\n", r++);
+    printf("\033[%d;6H\033[1mDown\033[0m / \033[1mj\033[0m / \033[1mJ\033[0m       Fine scroll down (fit-width) / Next page (fit-height)\033[K\r\n", r++);
+    printf("\033[%d;6H\033[1mUp\033[0m   / \033[1mk\033[0m / \033[1mK\033[0m       Fine scroll up (fit-width) / Previous page (fit-height)\033[K\r\n", r++);
     printf("\033[%d;6H\033[1m[\033[0m    / \033[1m]\033[0m              Decrease / increase scroll step ratio\033[K\r\n", r++);
     r++;
     printf("\033[%d;4H\033[1;33mDisplay & Adjustments\033[0m\033[K\r\n", r++);
@@ -1549,7 +1573,7 @@ static void viewer_show_help(doc_viewer *v) {
                     if (tab->back_count < 64) tab->back_stack[tab->back_count++] = (view_loc){ .page = tab->current_page_idx, .y = (double)tab->virtual_y };
                     viewer_goto_page(v, loc.page);
                 }
-            } else if (key == KEY_MOUSE_LEFT || key == KEY_MOUSE_CTRL_CLICK) {
+            } else if (key == KEY_MOUSE_LEFT || key == KEY_MOUSE_CTRL_CLICK || key == KEY_MOUSE_ALT_CLICK) {
                 term_log_keystroke("ACTION: Mouse click at col=%d, row=%d (tab_count=%zu, active_tab=%zu)",
                                    mouse_col, mouse_row, v->tab_count, v->active_tab_idx + 1);
                 bool is_close = false;

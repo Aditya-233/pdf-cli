@@ -388,6 +388,82 @@ int main(void) {
     printf(" PASSED\n");
 
     viewer_destroy(v);
+
+    // Test 15: Control character sanitization and buffer safety in viewer_truncate_to_display_width
+    printf("  [TEST] Control character sanitization and buffer safety in truncate...");
+    fflush(stdout);
+    char buf15[64];
+    // Newline / carriage return / tab / escape sanitization
+    viewer_truncate_to_display_width(buf15, sizeof(buf15), "doc\nname\rtest\tfile\033[31m.pdf", 30, false);
+    assert(strchr(buf15, '\n') == NULL);
+    assert(strchr(buf15, '\r') == NULL);
+    assert(strchr(buf15, '\t') == NULL);
+    assert(strchr(buf15, '\033') == NULL);
+    // Small buffer truncation without buffer overrun
+    char small_buf[8];
+    viewer_truncate_to_display_width(small_buf, sizeof(small_buf), "VeryLongFileNameHere.pdf", 20, true);
+    assert(strlen(small_buf) < sizeof(small_buf));
+    assert(strstr(small_buf, "...") != NULL);
+    // Zero width / NULL handling
+    viewer_truncate_to_display_width(buf15, sizeof(buf15), NULL, 10, true);
+    assert(buf15[0] == '\0');
+    viewer_truncate_to_display_width(buf15, 0, "test.pdf", 10, true);
+    printf(" PASSED\n");
+
+    // Test 16: Zero and minimal terminal dimension resiliency
+    printf("  [TEST] Zero and minimal terminal dimension resiliency...");
+    fflush(stdout);
+    v = viewer_create(doc1_path);
+    assert(v != NULL);
+    assert(viewer_open(v));
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+    viewer_set_term_size(v, 5, 1); // 5 cols, 1 row (tabs do not fit)
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+    for (int c = 1; c <= 80; c++) {
+        assert(viewer_find_tab_hit(v, c, 1, &is_close) == -1);
+    }
+    printf(" PASSED\n");
+
+    // Test 17: Inactive tab close button click immunity
+    printf("  [TEST] Inactive tab close button click immunity...");
+    fflush(stdout);
+    create_test_pdf(doc2_path);
+    mute_stdout();
+    assert(viewer_add_tab(v, doc2_path));
+    unmute_stdout();
+    assert(viewer_get_tab_count(v) == 2);
+    // Tab 1 is active, Tab 0 is inactive
+    assert(viewer_get_active_tab(v) == 1);
+    viewer_set_term_size(v, 80, 24);
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+    // Test EVERY column of Tab 0: is_close must NEVER be true
+    for (int c = 1; c <= 80; c++) {
+        int hit = viewer_find_tab_hit(v, c, 1, &is_close);
+        if (hit == 0) {
+            assert(!is_close);
+        }
+    }
+    printf(" PASSED\n");
+
+    // Test 18: Rapid toggle hammering and timer consistency
+    printf("  [TEST] Rapid toggle hammering and timer consistency...");
+    fflush(stdout);
+    viewer_dismiss_hud(v);
+    assert(!viewer_is_tab_bar_visible(v));
+    for (int i = 0; i < 50; i++) {
+        viewer_toggle_hud(v);
+        assert(viewer_is_tab_bar_visible(v));
+        viewer_toggle_hud(v);
+        assert(!viewer_is_tab_bar_visible(v));
+    }
+    printf(" PASSED\n");
+
+    viewer_destroy(v);
     unlink(doc1_path);
     unlink(doc2_path);
 
