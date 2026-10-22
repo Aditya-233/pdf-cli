@@ -20,7 +20,8 @@ struct doc_handle {
 [[nodiscard]] doc_handle *doc_open(const char *path) {
     PROFILE_SCOPE("doc_engine", "doc_engine_open");
     if (!path) return nullptr;
-    fz_context *ctx = fz_new_context(profile_get_fitz_alloc(), nullptr, FZ_STORE_DEFAULT);
+    // Bounded 4 MB store size prevents unbound caching of PDF objects, glyphs, and images across tabs
+    fz_context *ctx = fz_new_context(profile_get_fitz_alloc(), nullptr, 4 * 1024 * 1024);
     if (!ctx) return nullptr;
     fz_register_document_handlers(ctx);
     fz_document *doc = nullptr;
@@ -34,6 +35,13 @@ struct doc_handle {
     pthread_mutex_init(&h->mu, nullptr);
     fz_try(ctx) { h->page_count = fz_count_pages(ctx, doc); } fz_catch(ctx) { h->page_count = 0; }
     return h;
+}
+
+void doc_empty_store(doc_handle *h) {
+    if (!h || !h->ctx) return;
+    pthread_mutex_lock(&h->mu);
+    fz_empty_store(h->ctx);
+    pthread_mutex_unlock(&h->mu);
 }
 
 void doc_close(doc_handle *h) {
@@ -152,6 +160,50 @@ void doc_close(doc_handle *h) {
         PROFILE_EVENT("raster", "viewport_dims_h", "h", pix->h);
     }
     return pix;
+}
+
+bool doc_render_page_into(doc_handle *h, int page_num, double scale, int sx, int sy, int vw, int vh, fz_pixmap *dst, int dst_x, int dst_y) {
+    PROFILE_SCOPE("raster", "doc_engine_render_into");
+    if (!h || !h->ctx || !h->doc || page_num < 0 || page_num >= h->page_count) return false;
+    if (!dst || !dst->samples || vw <= 0 || vh <= 0) return false;
+    if (dst_x < 0 || dst_y < 0 || dst_x + vw > dst->w || dst_y + vh > dst->h) return false;
+    if (scale <= 0.0) scale = 1.0;
+    pthread_mutex_lock(&h->mu);
+    bool ok = false;
+    fz_page *p = nullptr;
+    fz_device *dev = nullptr;
+    fz_pixmap *sub = nullptr;
+    fz_var(p);
+    fz_var(dev);
+    fz_var(sub);
+    fz_var(ok);
+    fz_try(h->ctx) {
+        p = fz_load_page(h->ctx, h->doc, page_num);
+        if (p) {
+            fz_matrix ctm = fz_concat(fz_scale((float)scale, (float)scale), fz_translate((float)-sx, (float)-sy));
+            // Wrap the destination region of the composite pixmap as a sub-pixmap.
+            // The draw device then clips the page to exactly the slice area and
+            // paints straight into the composite buffer (no intermediate alloc/copy).
+            // The sub-pixmap does NOT own the samples (free_samples == 0).
+            unsigned char *region = dst->samples + (ptrdiff_t)dst_y * dst->stride + (ptrdiff_t)dst_x * dst->n;
+            sub = fz_new_pixmap_with_data(h->ctx, dst->colorspace, vw, vh, nullptr, dst->alpha, (int)dst->stride, region);
+            fz_clear_pixmap_with_value(h->ctx, sub, 0xff);
+            dev = fz_new_draw_device(h->ctx, ctm, sub);
+            fz_run_page(h->ctx, p, dev, fz_identity, nullptr);
+            fz_close_device(h->ctx, dev);
+            fz_drop_device(h->ctx, dev);
+            dev = nullptr;
+            fz_drop_pixmap(h->ctx, sub);
+            sub = nullptr;
+            ok = true;
+        }
+    } fz_always(h->ctx) {
+        if (dev) fz_drop_device(h->ctx, dev);
+        if (sub) fz_drop_pixmap(h->ctx, sub);
+        if (p) fz_drop_page(h->ctx, p);
+    } fz_catch(h->ctx) { ok = false; }
+    pthread_mutex_unlock(&h->mu);
+    return ok;
 }
 
 void doc_layout_reflowable(doc_handle *h, double w, double height, double em) {

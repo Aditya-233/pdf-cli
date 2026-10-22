@@ -50,6 +50,24 @@ void doc_close(doc_handle *doc);
     int view_w,
     int view_h
 );
+
+// Render the page slice (source offset src_x,src_y at 'scale', size view_w*view_h)
+// directly into the destination region (dst_x,dst_y) of an existing composite
+// pixmap. Avoids the intermediate full-size slice pixmap plus the row copy.
+// Returns true on success; false if bounds are violated or rendering fails
+// (caller can fall back to doc_render_page_viewport + row copy).
+[[nodiscard]] bool doc_render_page_into(
+    doc_handle *doc,
+    int page_num,
+    double scale,
+    int src_x,
+    int src_y,
+    int view_w,
+    int view_h,
+    fz_pixmap *dst,
+    int dst_x,
+    int dst_y
+);
 void doc_layout_reflowable(doc_handle *doc, double width_pts, double height_pts, double em_size);
 [[nodiscard]] doc_page_link *doc_get_page_links(doc_handle *doc, int page_num, size_t *out_count);
 void doc_free_page_links(doc_page_link *links, size_t count);
@@ -57,6 +75,7 @@ void doc_free_page_links(doc_page_link *links, size_t count);
 void doc_free_toc(doc_toc_entry *toc, size_t count);
 [[nodiscard]] doc_search_hit *doc_search_text(doc_handle *doc, const char *needle, size_t *out_count);
 void doc_free_search_hits(doc_search_hit *hits, size_t count);
+void doc_empty_store(doc_handle *doc);
 [[nodiscard]] fz_pixmap *doc_load_standalone_image(doc_handle *doc, const char *path);
 
 #ifdef __cplusplus

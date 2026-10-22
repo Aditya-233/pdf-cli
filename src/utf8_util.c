@@ -146,26 +146,31 @@ static int str_measure(const char *str, bool display_width) {
     if (!str) return 0;
     int total = 0;
     const char *p = str;
+    size_t rem = strlen(str);
 
-    while (*p) {
+    while (rem > 0) {
         // Fast-path chunks of 8 bytes for standard non-escape ASCII (0x20 <= c < 0x7F)
-        while (((uintptr_t)p & 0xFFF) <= (4096 - sizeof(uint64_t))) {
+        while (rem >= sizeof(uint64_t)) {
             uint64_t w;
             memcpy(&w, p, sizeof(uint64_t));
             if (!is_ascii_printable_word(w)) break;
             total += 8;
             p += 8;
+            rem -= 8;
         }
-        if (!*p) break;
+        if (rem == 0) break;
 
         if (__builtin_expect((unsigned char)*p >= 0x20 && (unsigned char)*p < 0x7F, 1)) {
             total++;
             p++;
+            rem--;
             continue;
         }
 
         if ((unsigned char)*p == 0x1B) {
-            p = skip_ansi_escape(p);
+            const char *nxt = skip_ansi_escape(p);
+            rem -= (size_t)(nxt - p);
+            p = nxt;
             continue;
         }
 
@@ -175,8 +180,10 @@ static int str_measure(const char *str, bool display_width) {
             int w = display_width ? utf8_width(cp) : 1;
             if (w > 0) total += w;
             p += len;
+            rem = (rem >= len) ? (rem - len) : 0;
         } else {
             p++;
+            rem--;
         }
     }
     return total;

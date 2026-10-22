@@ -177,6 +177,23 @@ static int sixel_buf_write_cb(char *data, int size, void *priv) {
     return size;
 }
 
+static void term_gfx_sixel_release_frame(void) {
+    // Do not retain large, frame-sized buffers between draws: the encoded sixel
+    // stream for a full-screen frame can be several MB, and the indexed buffer is
+    // w*h bytes. The output object also owns encode tables; drop it too.
+    if (s_sixel_out) {
+        sixel_output_unref(s_sixel_out);
+        s_sixel_out = nullptr;
+    }
+    free(s_cached_sixel.buf);
+    s_cached_sixel.buf = nullptr;
+    s_cached_sixel.len = 0;
+    s_cached_sixel.cap = 0;
+    free(s_indexed_buf);
+    s_indexed_buf = nullptr;
+    s_indexed_cap = 0;
+}
+
 static void term_gfx_sixel_cleanup(void) {
     if (s_sixel_dither) {
         sixel_dither_unref(s_sixel_dither);
@@ -399,17 +416,20 @@ void term_gfx_kitty_delete_image(uint32_t id) {
     }
     if (!SIXEL_SUCCEEDED(sixel_output_new(&s_sixel_out, sixel_buf_write_cb, &s_cached_sixel, nullptr))) {
         free(cbuf);
+        term_gfx_sixel_release_frame();
         return false;
     }
     if (!s_sixel_dither) {
         if (!SIXEL_SUCCEEDED(sixel_dither_new(&s_sixel_dither, 256, nullptr))) {
             free(cbuf);
+            term_gfx_sixel_release_frame();
             return false;
         }
     }
 
     if (!SIXEL_SUCCEEDED(sixel_dither_initialize(s_sixel_dither, (unsigned char *)samples, pix->w, pix->h, fmt, SIXEL_LARGE_AUTO, SIXEL_REP_AUTO, SIXEL_QUALITY_LOW))) {
         free(cbuf);
+        term_gfx_sixel_release_frame();
         return false;
     }
 
@@ -426,6 +446,7 @@ void term_gfx_kitty_delete_image(uint32_t id) {
             fflush(stdout);
             PROFILE_END("gfx", "stdout_flush");
         }
+        term_gfx_sixel_release_frame();
         return ok;
     }
 
@@ -435,6 +456,7 @@ void term_gfx_kitty_delete_image(uint32_t id) {
         unsigned char *nb = (unsigned char *)realloc(s_indexed_buf, ncap);
         if (!nb) {
             free(cbuf);
+            term_gfx_sixel_release_frame();
             return false;
         }
         s_indexed_buf = nb;
@@ -518,6 +540,7 @@ void term_gfx_kitty_delete_image(uint32_t id) {
         fflush(stdout);
         PROFILE_END("gfx", "stdout_flush");
     }
+    term_gfx_sixel_release_frame();
     return ok;
 }
 

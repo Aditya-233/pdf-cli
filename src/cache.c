@@ -54,7 +54,10 @@ static inline uint64_t hash_str(const char *str) {
 [[nodiscard]] page_cache *cache_create(size_t max_entries) {
     page_cache *c = calloc(1, sizeof(page_cache));
     if (!c) return nullptr;
-    c->max_entries = (max_entries > 0) ? max_entries : 16;
+    // max_entries == 0 disables pixmap retention entirely: cache_get returns
+    // nullptr and cache_put drops the pixmap reference on the floor (the
+    // caller's reference is unaffected).
+    c->max_entries = max_entries;
     pthread_mutex_init(&c->lock, nullptr);
     return c;
 }
@@ -200,7 +203,7 @@ void cache_destroy(page_cache *c, fz_context *ctx) {
 
 void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, const char *png_path) {
     PROFILE_SCOPE("cache", "cache_put");
-    if (!c || !key) return;
+    if (!c || !key || c->max_entries == 0) return;
     uint64_t hash = hash_str(key);
     pthread_mutex_lock(&c->lock);
     size_t pix_bytes = (pix && ctx) ? fz_pixmap_size(ctx, pix) : 0;
@@ -221,7 +224,7 @@ void cache_put(page_cache *c, fz_context *ctx, const char *key, fz_pixmap *pix, 
         pthread_mutex_unlock(&c->lock);
         return;
     }
-    while ((c->count >= c->max_entries || (c->total_bytes > 32 * 1024 * 1024 && c->count > 1)) && c->tail) {
+    while ((c->count >= c->max_entries || (c->total_bytes > 8 * 1024 * 1024 && c->count > 1)) && c->tail) {
         PROFILE_START("cache", "cache_eviction");
         struct cache_node *old = c->tail;
         remove_lru_node(c, old);

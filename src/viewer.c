@@ -120,6 +120,12 @@ struct doc_viewer {
     uint64_t status_until_ms;
     uint64_t tab_bar_until_ms;
 
+    // Render coalescing: key handlers only update view state. The expensive
+    // raster+sixel frame is rendered once, after input has been idle briefly.
+    bool defer_render;
+    bool render_pending;
+    uint64_t render_due_ms;
+
     tab_hit_box hit_boxes[MAX_TABS];
 };
 
@@ -234,23 +240,25 @@ static void viewer_tab_prefetch_page_dims(viewer_tab *tab) {
     }
     tab->page_dims_count = tab->content_page_count;
 
-    for (size_t i = 0; i < tab->content_page_count; i++) {
-        if (tab->is_image && tab->standalone_image) {
-            tab->page_widths[i] = (float)tab->standalone_image->w;
-            tab->page_heights[i] = (float)tab->standalone_image->h;
-        } else if (tab->doc) {
-            int doc_p = tab->content_pages[i];
-            fz_rect b = doc_get_page_bounds(tab->doc, doc_p);
-            float pw = (float)(b.x1 - b.x0);
-            float ph = (float)(b.y1 - b.y0);
-            if (pw <= 0.0f) pw = 612.0f;
-            if (ph <= 0.0f) ph = 792.0f;
-            tab->page_widths[i] = pw;
-            tab->page_heights[i] = ph;
-        } else {
-            tab->page_widths[i] = 612.0f;
-            tab->page_heights[i] = 792.0f;
+    float default_pw = 612.0f;
+    float default_ph = 792.0f;
+
+    if (tab->is_image && tab->standalone_image) {
+        default_pw = (float)tab->standalone_image->w;
+        default_ph = (float)tab->standalone_image->h;
+    } else if (tab->doc && tab->content_page_count > 0) {
+        int doc_p = tab->content_pages[0];
+        fz_rect b = doc_get_page_bounds(tab->doc, doc_p);
+        if (b.x1 > b.x0 && b.y1 > b.y0) {
+            default_pw = (float)(b.x1 - b.x0);
+            default_ph = (float)(b.y1 - b.y0);
         }
+        doc_empty_store(tab->doc);
+    }
+
+    for (size_t i = 0; i < tab->content_page_count; i++) {
+        tab->page_widths[i] = default_pw;
+        tab->page_heights[i] = default_ph;
     }
 }
 
@@ -402,10 +410,51 @@ static bool viewer_tab_open(viewer_tab *tab) {
             tab->doc = nullptr;
             return false;
         }
-        tab->toc = doc_get_toc(tab->doc, &tab->toc_count);
     }
     viewer_tab_prefetch_page_dims(tab);
     tab->watcher = file_watcher_create(tab->file_path);
+    return true;
+}
+
+static void viewer_tab_unload(viewer_tab *tab) {
+    if (!tab) return;
+    if (tab->doc) {
+        doc_close(tab->doc);
+        tab->doc = nullptr;
+    }
+    if (tab->toc) {
+        doc_free_toc(tab->toc, tab->toc_count);
+        tab->toc = nullptr;
+        tab->toc_count = 0;
+    }
+    if (tab->current_links) {
+        doc_free_page_links(tab->current_links, tab->current_links_count);
+        tab->current_links = nullptr;
+        tab->current_links_count = 0;
+    }
+    tab->layout_valid = false;
+}
+
+static bool viewer_tab_ensure_open(viewer_tab *tab) {
+    if (!tab || !tab->file_path) return false;
+    if (tab->doc) return true;
+    tab->doc = doc_open(tab->file_path);
+    if (!tab->doc) return false;
+    if (tab->is_image) {
+        if (!tab->standalone_image) {
+            tab->standalone_image = doc_load_standalone_image(tab->doc, tab->file_path);
+        }
+    } else {
+        if (tab->is_reflowable) {
+            doc_layout_reflowable(tab->doc, (double)tab->html_page_width, (double)tab->html_page_width * 1.414, 12.0);
+        }
+        if (!tab->content_pages || tab->content_page_count == 0) {
+            viewer_tab_find_content_pages(tab);
+        }
+    }
+    if (!tab->page_widths || tab->page_dims_count == 0) {
+        viewer_tab_prefetch_page_dims(tab);
+    }
     return true;
 }
 
@@ -584,9 +633,16 @@ void viewer_set_term_size(doc_viewer *v, int cols, int rows) {
 }
 
 static void viewer_display_current_page(doc_viewer *v) {
+    if (!v) return;
+    if (v->defer_render) {
+        v->render_pending = true;
+        v->render_due_ms = get_time_ms() + 70;
+        return;
+    }
+    v->render_pending = false;
     PROFILE_SCOPE("viewer", "viewer_render");
     profile_record_frame();
-    if (!v || v->tab_count == 0) return;
+    if (v->tab_count == 0) return;
     if (v->active_tab_idx >= v->tab_count) v->active_tab_idx = v->tab_count - 1;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
 
@@ -619,9 +675,15 @@ static void viewer_display_current_page(doc_viewer *v) {
                  cur_idx + 1, current_doc_page, viewer_fit_name(tab->fit), tab->zoom, total_w_px, content_h_px);
 
     fz_context *ctx = tab->doc ? doc_get_context(tab->doc) : nullptr;
+    if (!ctx) {
+        viewer_tab_ensure_open(tab);
+        ctx = tab->doc ? doc_get_context(tab->doc) : nullptr;
+    }
     if (!ctx) return;
 
-    fz_pixmap *vpix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_make_irect(0, 0, total_w_px, content_h_px), nullptr, 1);
+    // No alpha: 25% smaller per-frame buffer (n=3), and every output path
+    // (sixel/kitty/iterm2/blocks) handles opaque RGB pixmaps natively.
+    fz_pixmap *vpix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_make_irect(0, 0, total_w_px, content_h_px), nullptr, 0);
     if (!vpix) return;
     fz_clear_pixmap_with_value(ctx, vpix, 0x18);
 
@@ -681,22 +743,26 @@ static void viewer_display_current_page(doc_viewer *v) {
         int src_y = (int)(v0 - page_y0);
         int dst_y = (int)(v0 - tab->virtual_y);
 
-        char vkey[256];
-        snprintf(vkey, sizeof(vkey), "doc:%p:p%d:s%.4f:sx%d:y%d:w%d:h%d", (void *)tab->doc, doc_p, scale, sx, src_y, slice_w, slice_h);
-        fz_pixmap *spix = cache_get(v->cache, ctx, vkey);
-        if (!spix) {
-            spix = doc_render_page_viewport(tab->doc, doc_p, scale, sx, src_y, slice_w, slice_h);
-            if (spix) {
-                cache_put(v->cache, ctx, vkey, spix, nullptr);
-            }
+        // Render the slice directly into the destination region of the composite
+        // viewport pixmap (eliminates the second full-size slice pixmap and the
+        // per-row memcpy, and nothing is retained in the page cache).
+        bool drawn = false;
+        if (dst_x >= 0 && dst_y >= 0 && slice_w > 0 && slice_h > 0 &&
+            dst_x + slice_w <= total_w_px && dst_y + slice_h <= content_h_px) {
+            drawn = doc_render_page_into(tab->doc, doc_p, scale, sx, src_y, slice_w, slice_h, vpix, dst_x, dst_y);
         }
-        if (spix) {
-            for (int r = 0; r < spix->h && (dst_y + r) < content_h_px; r++) {
-                unsigned char *dst_row = vpix->samples + (size_t)(dst_y + r) * vpix->stride + (size_t)dst_x * vpix->n;
-                unsigned char *src_row = spix->samples + (size_t)r * spix->stride;
-                memcpy(dst_row, src_row, (size_t)spix->w * spix->n);
+        if (!drawn) {
+            // Fallback for degenerate bounds / render failure: render the slice
+            // standalone and copy its rows into the composite pixmap.
+            fz_pixmap *spix = doc_render_page_viewport(tab->doc, doc_p, scale, sx, src_y, slice_w, slice_h);
+            if (spix) {
+                for (int r = 0; r < spix->h && (dst_y + r) < content_h_px; r++) {
+                    unsigned char *dst_row = vpix->samples + (size_t)(dst_y + r) * vpix->stride + (size_t)dst_x * vpix->n;
+                    unsigned char *src_row = spix->samples + (size_t)r * spix->stride;
+                    memcpy(dst_row, src_row, (size_t)spix->w * spix->n);
+                }
+                fz_drop_pixmap(ctx, spix);
             }
-            fz_drop_pixmap(ctx, spix);
         }
 
         if (i == cur_idx) {
@@ -745,6 +811,16 @@ static void viewer_display_current_page(doc_viewer *v) {
         printf("\033[%d;1H\033[7m %s \033[0m\033[K", v->term_rows, disp_status);
     }
     term_end_sync();
+    if (tab->doc) {
+        doc_empty_store(tab->doc);
+        // PDF xref tables and the page tree can be several MB (Module-4: 6.6 MB).
+        // Keep only the cheap cached metadata between frames; reopen lazily on the
+        // next action. Image tabs keep their decoded pixmap tied to the context.
+        if (!tab->is_image && !tab->standalone_image) {
+            doc_close(tab->doc);
+            tab->doc = nullptr;
+        }
+    }
 #if defined(__linux__)
     malloc_trim(0);
 #endif
@@ -826,7 +902,10 @@ static bool viewer_handle_link_click(doc_viewer *v, int col, int row) {
     v->tab_count = 1;
     v->active_tab_idx = 0;
 
-    v->cache = cache_create(4);
+    // No page pixmap cache in the main display path: each frame renders slices
+    // straight into the composite viewport pixmap, so a retained cache entry
+    // (a full-screen RGBA pixmap) would just pin ~9 MB at idle for no reuse.
+    v->cache = cache_create(0);
     v->gfx = term_gfx_init();
     return v;
 }
@@ -850,6 +929,10 @@ static bool viewer_handle_link_click(doc_viewer *v, int col, int row) {
         viewer_tab_free(&v->tabs[idx]);
         return false;
     }
+    // We only need the cached metadata (page count, page 0 dimensions, content
+    // pages) to add a tab. Do not keep the PDF xref/page tree resident: with
+    // several docs this alone is tens of MB before the first frame.
+    if (!v->tabs[idx].is_image) viewer_tab_unload(&v->tabs[idx]);
     v->tab_count++;
     v->active_tab_idx = idx;
     term_set_title(v->tabs[idx].file_path);
@@ -865,19 +948,45 @@ void viewer_switch_tab(doc_viewer *v, size_t index) {
     size_t old_idx = v->active_tab_idx;
     viewer_tab_save_config(&v->tabs[v->active_tab_idx]);
 
+    // Clear cache using the old tab's valid context before unloading the document
+    fz_context *old_ctx = v->tabs[old_idx].doc ? doc_get_context(v->tabs[old_idx].doc) : nullptr;
+    if (v->cache) cache_clear(v->cache, old_ctx);
+    viewer_tab_unload(&v->tabs[old_idx]);
+
     v->active_tab_idx = index;
-    term_set_title(v->tabs[v->active_tab_idx].file_path);
+    viewer_tab *new_tab = &v->tabs[index];
+    // Do not open the document here: during rapid tab cycling this would load
+    // (and then discard) every tab's xref table/page tree. The deferred render
+    // path opens only the tab the user actually settles on.
+
+    term_set_title(new_tab->file_path);
     char msg[128];
-    snprintf(msg, sizeof(msg), "Tab %zu/%zu: %s", index + 1, v->tab_count, v->tabs[index].display_name ? v->tabs[index].display_name : "doc");
+    snprintf(msg, sizeof(msg), "Tab %zu/%zu: %s", index + 1, v->tab_count, new_tab->display_name ? new_tab->display_name : "doc");
     viewer_set_status(v, msg, 1000);
     term_log_keystroke("TAB SWITCH: from tab %zu to tab %zu (\"%s\", %zu pages)",
-                       old_idx + 1, index + 1, v->tabs[index].display_name ? v->tabs[index].display_name : "doc", v->tabs[index].content_page_count);
+                       old_idx + 1, index + 1, new_tab->display_name ? new_tab->display_name : "doc", new_tab->content_page_count);
+
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
+
     viewer_display_current_page(v);
 }
 
 void viewer_set_active_tab(doc_viewer *v, size_t index) {
     if (!v || index >= v->tab_count) return;
+    for (size_t i = 0; i < v->tab_count; i++) {
+        if (i != index) {
+            fz_context *ctx = v->tabs[i].doc ? doc_get_context(v->tabs[i].doc) : nullptr;
+            if (v->cache && ctx) cache_clear(v->cache, ctx);
+            viewer_tab_unload(&v->tabs[i]);
+        }
+    }
     v->active_tab_idx = index;
+    (void)viewer_tab_ensure_open(&v->tabs[index]);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
 }
 
 void viewer_close_tab(doc_viewer *v, size_t index) {
@@ -907,6 +1016,10 @@ void viewer_close_tab(doc_viewer *v, size_t index) {
     } else if (v->active_tab_idx > index) {
         v->active_tab_idx--;
     }
+    (void)viewer_tab_ensure_open(&v->tabs[v->active_tab_idx]);
+#if defined(__linux__)
+    malloc_trim(0);
+#endif
     term_set_title(v->tabs[v->active_tab_idx].file_path);
     viewer_display_current_page(v);
 }
@@ -1183,6 +1296,7 @@ static void viewer_show_help(doc_viewer *v) {
     [[maybe_unused]] uint64_t last_wheel_ms = 0;
 
     while (v->tab_count > 0) {
+        v->defer_render = false;
         if (term_poll_resize()) {
             term_get_size(&v->term_cols, &v->term_rows);
             term_detect_cell_size(&v->cell_w_px, &v->cell_h_px);
@@ -1215,6 +1329,10 @@ static void viewer_show_help(doc_viewer *v) {
                 next_expire = v->status_until_ms;
             }
         }
+        if (v->render_pending) {
+            if (next_expire == 0 || v->render_due_ms < next_expire) next_expire = v->render_due_ms;
+            if (v->render_due_ms <= now_before) poll_timeout = 0;
+        }
         if (next_expire > now_before) {
             int rem = (int)(next_expire - now_before) + 1;
             if (rem < poll_timeout) poll_timeout = rem;
@@ -1238,12 +1356,19 @@ static void viewer_show_help(doc_viewer *v) {
             viewer_display_current_page(v);
         }
 
+        // Coalesced frame: input has been quiet for the debounce window.
+        if (v->render_pending && now_after >= v->render_due_ms && !(pfds[0].revents & POLLIN)) {
+            v->render_pending = false;
+            viewer_display_current_page(v);
+        }
+
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
             break;
         }
 
         if (pfds[0].revents & POLLIN) {
             PROFILE_START("viewer", "viewer_handle_key");
+            v->defer_render = true;
             char key_buf[32] = {};
             int mouse_col = 0, mouse_row = 0;
             int key = term_read_key(STDIN_FILENO, key_buf, sizeof(key_buf), &mouse_col, &mouse_row);
@@ -1544,6 +1669,11 @@ static void viewer_show_help(doc_viewer *v) {
                 }
             } else if (key == 'T') {
                 viewer_dismiss_hud(v);
+                // The document may be closed between frames; reopen just for TOC.
+                if (!tab->toc) {
+                    if (!tab->doc) (void)viewer_tab_ensure_open(tab);
+                    if (tab->doc) tab->toc = doc_get_toc(tab->doc, &tab->toc_count);
+                }
                 if (tab->toc && tab->toc_count > 0) {
                     int cur_doc_p = tab->content_pages ? tab->content_pages[tab->current_page_idx] : 0;
                     int target = toc_modal_run(tab->toc, tab->toc_count, cur_doc_p);
@@ -1552,8 +1682,11 @@ static void viewer_show_help(doc_viewer *v) {
                             if (tab->content_pages[p] == target) { viewer_goto_page(v, (int)p); break; }
                         }
                     }
-                    viewer_display_current_page(v);
+                    doc_free_toc(tab->toc, tab->toc_count);
+                    tab->toc = nullptr;
+                    tab->toc_count = 0;
                 }
+                viewer_display_current_page(v);
             } else if (key == 'h') {
                 viewer_dismiss_hud(v);
                 viewer_show_help(v);
@@ -1602,25 +1735,28 @@ static void viewer_show_help(doc_viewer *v) {
                 }
             }
             PROFILE_END("viewer", "viewer_handle_key");
+            v->defer_render = false;
         }
 
         // Check file modification for all tabs
         for (size_t i = 0; i < v->tab_count; i++) {
             if (file_watcher_check_modified(v->tabs[i].watcher)) {
+                // Documents are closed between frames; reopen to refresh metadata.
+                if (!v->tabs[i].doc && !viewer_tab_ensure_open(&v->tabs[i])) continue;
+                doc_close(v->tabs[i].doc);
+                v->tabs[i].doc = doc_open(v->tabs[i].file_path);
                 if (v->tabs[i].doc) {
-                    doc_close(v->tabs[i].doc);
-                    v->tabs[i].doc = doc_open(v->tabs[i].file_path);
-                    if (v->tabs[i].doc) {
-                        if (v->tabs[i].is_reflowable)
-                            doc_layout_reflowable(v->tabs[i].doc, (double)v->tabs[i].html_page_width, (double)v->tabs[i].html_page_width * 1.414, 12.0);
-                        viewer_tab_find_content_pages(&v->tabs[i]);
-                        viewer_tab_prefetch_page_dims(&v->tabs[i]);
-                        v->tabs[i].layout_valid = false;
-                        cache_clear(v->cache, doc_get_context(v->tabs[i].doc));
-                        if (i == v->active_tab_idx) {
-                            viewer_display_current_page(v);
-                            viewer_set_status(v, "Reloaded document", 1500);
-                        }
+                    if (v->tabs[i].is_reflowable)
+                        doc_layout_reflowable(v->tabs[i].doc, (double)v->tabs[i].html_page_width, (double)v->tabs[i].html_page_width * 1.414, 12.0);
+                    viewer_tab_find_content_pages(&v->tabs[i]);
+                    viewer_tab_prefetch_page_dims(&v->tabs[i]);
+                    v->tabs[i].layout_valid = false;
+                    cache_clear(v->cache, doc_get_context(v->tabs[i].doc));
+                    if (i == v->active_tab_idx) {
+                        viewer_display_current_page(v);
+                        viewer_set_status(v, "Reloaded document", 1500);
+                    } else if (!v->tabs[i].is_image) {
+                        viewer_tab_unload(&v->tabs[i]);
                     }
                 }
             }
