@@ -120,12 +120,6 @@ struct doc_viewer {
     uint64_t status_until_ms;
     uint64_t tab_bar_until_ms;
 
-    // Render coalescing: key handlers only update view state. The expensive
-    // raster+sixel frame is rendered once, after input has been idle briefly.
-    bool defer_render;
-    bool render_pending;
-    uint64_t render_due_ms;
-
     tab_hit_box hit_boxes[MAX_TABS];
 };
 
@@ -634,12 +628,6 @@ void viewer_set_term_size(doc_viewer *v, int cols, int rows) {
 
 static void viewer_display_current_page(doc_viewer *v) {
     if (!v) return;
-    if (v->defer_render) {
-        v->render_pending = true;
-        v->render_due_ms = get_time_ms() + 70;
-        return;
-    }
-    v->render_pending = false;
     PROFILE_SCOPE("viewer", "viewer_render");
     profile_record_frame();
     if (v->tab_count == 0) return;
@@ -1296,7 +1284,6 @@ static void viewer_show_help(doc_viewer *v) {
     [[maybe_unused]] uint64_t last_wheel_ms = 0;
 
     while (v->tab_count > 0) {
-        v->defer_render = false;
         if (term_poll_resize()) {
             term_get_size(&v->term_cols, &v->term_rows);
             term_detect_cell_size(&v->cell_w_px, &v->cell_h_px);
@@ -1329,10 +1316,6 @@ static void viewer_show_help(doc_viewer *v) {
                 next_expire = v->status_until_ms;
             }
         }
-        if (v->render_pending) {
-            if (next_expire == 0 || v->render_due_ms < next_expire) next_expire = v->render_due_ms;
-            if (v->render_due_ms <= now_before) poll_timeout = 0;
-        }
         if (next_expire > now_before) {
             int rem = (int)(next_expire - now_before) + 1;
             if (rem < poll_timeout) poll_timeout = rem;
@@ -1356,19 +1339,12 @@ static void viewer_show_help(doc_viewer *v) {
             viewer_display_current_page(v);
         }
 
-        // Coalesced frame: input has been quiet for the debounce window.
-        if (v->render_pending && now_after >= v->render_due_ms && !(pfds[0].revents & POLLIN)) {
-            v->render_pending = false;
-            viewer_display_current_page(v);
-        }
-
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
             break;
         }
 
         if (pfds[0].revents & POLLIN) {
             PROFILE_START("viewer", "viewer_handle_key");
-            v->defer_render = true;
             char key_buf[32] = {};
             int mouse_col = 0, mouse_row = 0;
             int key = term_read_key(STDIN_FILENO, key_buf, sizeof(key_buf), &mouse_col, &mouse_row);
@@ -1735,7 +1711,6 @@ static void viewer_show_help(doc_viewer *v) {
                 }
             }
             PROFILE_END("viewer", "viewer_handle_key");
-            v->defer_render = false;
         }
 
         // Check file modification for all tabs

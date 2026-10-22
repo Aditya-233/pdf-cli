@@ -9,6 +9,47 @@
 #include <string.h>
 #include <pthread.h>
 #include <math.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+// MuPDF writes warnings through fz_warn(), which defaults to stderr. The
+// viewer owns the terminal in alternate-screen mode, so those writes corrupt
+// the bottom of the rendered page. Capture them and append to a log file
+// instead; warnings stay out of the TUI.
+static char g_warn_log_path[1024];
+static bool g_warn_log_ready;
+
+static void doc_warning_init(void) {
+    if (g_warn_log_ready) return;
+    g_warn_log_ready = true;
+
+    const char *xdg = getenv("XDG_STATE_HOME");
+    const char *home = getenv("HOME");
+    char dir[900];
+    if (xdg && *xdg) {
+        snprintf(dir, sizeof(dir), "%s/pdf-cli", xdg);
+    } else if (home && *home) {
+        snprintf(dir, sizeof(dir), "%s/.local/state/pdf-cli", home);
+    } else {
+        snprintf(g_warn_log_path, sizeof(g_warn_log_path), "/tmp/pdf-cli-warnings.log");
+        return;
+    }
+    (void)mkdir(dir, 0700);
+    snprintf(g_warn_log_path, sizeof(g_warn_log_path), "%s/warnings.log", dir);
+}
+
+static void doc_warning_cb(void *user, const char *message) {
+    (void)user;
+    if (!message || !*message) return;
+
+    doc_warning_init();
+    if (!g_warn_log_path[0]) return;
+    FILE *f = fopen(g_warn_log_path, "a");
+    if (f) {
+        fprintf(f, "%s\n", message);
+        fclose(f);
+    }
+}
 
 struct doc_handle {
     fz_context *ctx;
@@ -23,6 +64,8 @@ struct doc_handle {
     // Bounded 4 MB store size prevents unbound caching of PDF objects, glyphs, and images across tabs
     fz_context *ctx = fz_new_context(profile_get_fitz_alloc(), nullptr, 4 * 1024 * 1024);
     if (!ctx) return nullptr;
+    doc_warning_init();
+    fz_set_warning_callback(ctx, doc_warning_cb, nullptr);
     fz_register_document_handlers(ctx);
     fz_document *doc = nullptr;
     fz_var(doc);
