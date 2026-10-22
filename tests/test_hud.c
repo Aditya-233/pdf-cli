@@ -32,6 +32,25 @@ static void create_test_pdf(const char *path) {
     fclose(f);
 }
 
+static int s_saved_stdout = -1;
+static void mute_stdout(void) {
+    fflush(stdout);
+    s_saved_stdout = dup(STDOUT_FILENO);
+    int null_fd = open("/dev/null", O_WRONLY);
+    if (null_fd >= 0) {
+        dup2(null_fd, STDOUT_FILENO);
+        close(null_fd);
+    }
+}
+static void unmute_stdout(void) {
+    fflush(stdout);
+    if (s_saved_stdout >= 0) {
+        dup2(s_saved_stdout, STDOUT_FILENO);
+        close(s_saved_stdout);
+        s_saved_stdout = -1;
+    }
+}
+
 int main(void) {
     printf("===> Running HUD unit tests...\n");
 
@@ -119,13 +138,19 @@ int main(void) {
     }
     printf(" PASSED\n");
 
-    // Test 6: 2500ms duration expiration
+    // Test 6: 2500ms duration expiration & hit-box invalidation
     printf("  [TEST] HUD timer expiration after 2500ms window...");
     fflush(stdout);
     viewer_toggle_hud(v);
     assert(viewer_is_tab_bar_visible(v));
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+    bool test6_close = false;
+    assert(viewer_find_tab_hit(v, 1, 1, &test6_close) == 0);
     usleep(2550000); // 2550ms > 2500ms duration
     assert(!viewer_is_tab_bar_visible(v));
+    assert(viewer_find_tab_hit(v, 1, 1, &test6_close) == -1);
     printf(" PASSED\n");
 
     // Test 7: Single-tab close behavior
@@ -134,6 +159,113 @@ int main(void) {
     viewer_close_tab(v, 0);
     assert(viewer_get_tab_count(v) == 0);
     assert(!viewer_is_tab_bar_visible(v));
+    printf(" PASSED\n");
+
+    viewer_destroy(v);
+
+
+    // Test 8: Single-tab hit box calculation and exact close button boundary testing
+    printf("  [TEST] Single-tab hit box calculation & close button accuracy...");
+    fflush(stdout);
+    v = viewer_create(doc1_path);
+    assert(v != NULL);
+    assert(viewer_open(v));
+
+    bool is_close = false;
+    // When HUD is hidden, all row 1 clicks must return -1 (pass through to links)
+    for (int c = 1; c <= 80; c++) {
+        assert(viewer_find_tab_hit(v, c, 1, &is_close) == -1);
+    }
+
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // " 1: test_hud_do... × "
+    // Cols 1..18: Tab label (title ends at col 18)
+    // Cols 19..21: Close button (" × ")
+    // Col 22+: Outside tab
+    assert(viewer_find_tab_hit(v, 1, 1, &is_close) == 0 && !is_close);
+    assert(viewer_find_tab_hit(v, 5, 1, &is_close) == 0 && !is_close);
+    assert(viewer_find_tab_hit(v, 18, 1, &is_close) == 0 && !is_close); // Last char of title MUST NOT close tab!
+
+    assert(viewer_find_tab_hit(v, 19, 1, &is_close) == 0 && is_close); // Space before × MUST close tab!
+    assert(viewer_find_tab_hit(v, 20, 1, &is_close) == 0 && is_close); // × MUST close tab!
+    assert(viewer_find_tab_hit(v, 21, 1, &is_close) == 0 && is_close); // Space after × MUST close tab!
+
+    assert(viewer_find_tab_hit(v, 22, 1, &is_close) == -1); // Outside tab
+    assert(viewer_find_tab_hit(v, 10, 2, &is_close) == -1); // Row 2 is not row 1
+
+    viewer_dismiss_hud(v);
+    assert(!viewer_is_tab_bar_visible(v));
+    printf(" PASSED\n");
+
+    // Test 9: Multi-tab hit testing (inactive tab has no close button, active tab has close button)
+    printf("  [TEST] Multi-tab hit boxes & active close button distinction...");
+    fflush(stdout);
+    assert(viewer_add_tab(v, doc2_path));
+    assert(viewer_get_tab_count(v) == 2);
+    assert(viewer_get_active_tab(v) == 1);
+    assert(!viewer_is_tab_bar_visible(v));
+
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // Tab 0 is inactive: clicking anywhere on Tab 0 must return 0 and is_close == false
+    for (int c = 1; c <= 19; c++) {
+        int hit = viewer_find_tab_hit(v, c, 1, &is_close);
+        if (hit == 0) {
+            assert(!is_close);
+        }
+    }
+
+    // Tab 1 is active: title area is_close == false, close area is_close == true
+    bool found_active_close = false;
+    for (int c = 21; c <= 45; c++) {
+        int hit = viewer_find_tab_hit(v, c, 1, &is_close);
+        if (hit == 1 && is_close) {
+            found_active_close = true;
+        }
+    }
+    assert(found_active_close);
+
+    viewer_dismiss_hud(v);
+    assert(!viewer_is_tab_bar_visible(v));
+    printf(" PASSED\n");
+
+    // Test 10: UTF-8 tab title rendering and width measurement
+    printf("  [TEST] UTF-8 tab title hit testing without character corruption...");
+    fflush(stdout);
+    const char *doc_utf8_path = "/tmp/test_hud_тест_123456789.pdf";
+    create_test_pdf(doc_utf8_path);
+    assert(viewer_add_tab(v, doc_utf8_path));
+    assert(viewer_get_tab_count(v) == 3);
+    assert(!viewer_is_tab_bar_visible(v));
+
+    viewer_toggle_hud(v);
+    assert(viewer_is_tab_bar_visible(v));
+
+    mute_stdout();
+    viewer_render_tab_bar(v);
+    unmute_stdout();
+
+    // Verify Tab 2 (the active UTF-8 tab) has valid hit boxes and close button
+    found_active_close = false;
+    for (int c = 1; c <= 80; c++) {
+        int hit = viewer_find_tab_hit(v, c, 1, &is_close);
+        if (hit == 2 && is_close) {
+            found_active_close = true;
+        }
+    }
+    assert(found_active_close);
+    unlink(doc_utf8_path);
     printf(" PASSED\n");
 
     viewer_destroy(v);
