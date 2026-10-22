@@ -34,6 +34,7 @@ static void print_help(void) {
          "  --profile      Enable latency & memory profiling (flushes trace.json on exit)\n"
          "  ctl ...        Control running viewers (see: pdf-cli ctl help)\n\n"
          "TAB NAVIGATION:\n"
+         "  1 .. 9                       Switch directly to tab 1 through 9 (when multiple tabs)\n"
          "  Ctrl+1 .. Ctrl+9 (Alt+1..9) Switch directly to tab 1 through 9\n"
          "  Ctrl+0           (Alt+0)     Switch to tab 10 / last tab\n"
          "  Ctrl+Tab / gt                Cycle to next tab\n"
@@ -54,6 +55,7 @@ static void print_help(void) {
          "  D              Cycle tint (white/dim/dark/invert)\n"
          "  T              Table of contents modal\n"
          "  +, -           Zoom in / out\n"
+         "  i              Toggle document info & tab bar HUD\n"
          "  b              Back to file picker\n"
          "  q              Quit\n");
 }

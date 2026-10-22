@@ -37,6 +37,7 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 
 | Key / Mouse Action | Action |
 |--------------------|--------|
+| `1` .. `9` | Switch directly to tab 1 through 9 (when multiple tabs open) |
 | `Ctrl+1` .. `Ctrl+9` | Switch directly to tab 1 through 9 (or `Alt+1` .. `Alt+9` fallback) |
 | `Ctrl+0` | Switch to tab 10 / last active tab (or `Alt+0` fallback) |
 | `Ctrl+Tab` / `gt` | Cycle to next tab |
@@ -64,7 +65,7 @@ A terminal-based PDF, EPUB, DOCX, HTML, PNG, and JPEG viewer with fuzzy file sea
 | `D` | Cycle page tint (white / dim / dark / invert) |
 | `+` / `=` | Zoom in (+10%) |
 | `-` | Zoom out (-10%) |
-| `i` | Show document status info toast |
+| `i` | Toggle document info & top tab bar HUD |
 | `r` | Refresh display (re-detect cell size) |
 | `h` | Show help modal |
 | `q` | Quit viewer |

@@ -118,6 +118,7 @@ struct doc_viewer {
 
     char status_msg[256];
     uint64_t status_until_ms;
+    uint64_t tab_bar_until_ms;
 
     tab_hit_box hit_boxes[MAX_TABS];
 };
@@ -147,8 +148,45 @@ static const char *viewer_fit_name(fit_mode fit) {
 }
 
 static void viewer_set_status(doc_viewer *v, const char *msg, uint64_t duration_ms) {
-    snprintf(v->status_msg, sizeof(v->status_msg), "%s", msg);
-    v->status_until_ms = get_time_ms() + duration_ms;
+    if (!v) return;
+    if (msg && duration_ms > 0) {
+        snprintf(v->status_msg, sizeof(v->status_msg), "%s", msg);
+        v->status_until_ms = get_time_ms() + duration_ms;
+    } else {
+        v->status_msg[0] = '\0';
+        v->status_until_ms = 0;
+    }
+}
+
+[[nodiscard]] bool viewer_is_tab_bar_visible(const doc_viewer *v) {
+    if (!v || v->tab_count == 0) return false;
+    return get_time_ms() < v->tab_bar_until_ms;
+}
+
+void viewer_dismiss_hud(doc_viewer *v) {
+    if (!v) return;
+    v->tab_bar_until_ms = 0;
+    v->status_until_ms = 0;
+    v->status_msg[0] = '\0';
+    memset(v->hit_boxes, 0, sizeof(v->hit_boxes));
+}
+
+void viewer_toggle_hud(doc_viewer *v) {
+    if (!v || v->tab_count == 0) return;
+    if (viewer_is_tab_bar_visible(v)) {
+        viewer_dismiss_hud(v);
+    } else {
+        uint64_t now = get_time_ms();
+        v->tab_bar_until_ms = now + 2500;
+        viewer_tab *tab = &v->tabs[v->active_tab_idx];
+        char ibuf[256];
+        int curr_p = (tab->content_pages && tab->current_page_idx < (int)tab->content_page_count) ? tab->content_pages[tab->current_page_idx] + 1 : 1;
+        snprintf(ibuf, sizeof(ibuf), "[%zu/%zu] %s | Page %d/%zu (%d) | Zoom %.0f%% | Fit %s",
+                 v->active_tab_idx + 1, v->tab_count, tab->display_name ? tab->display_name : "doc",
+                 tab->current_page_idx + 1, tab->content_page_count, curr_p,
+                 tab->zoom * 100.0, viewer_fit_name(tab->fit));
+        viewer_set_status(v, ibuf, 2500);
+    }
 }
 
 static void viewer_tab_save_config(const viewer_tab *tab) {
@@ -399,7 +437,7 @@ static void viewer_display_current_page(doc_viewer *v);
 
 static void viewer_render_tab_bar(doc_viewer *v) {
     PROFILE_SCOPE("viewer", "viewer_render_tabs");
-    if (v->tab_count <= 1) return;
+    if (!v || v->tab_count == 0) return;
 
     printf("\033[1;1H\033[K");
     int cur_col = 1;
@@ -437,6 +475,9 @@ static void viewer_render_tab_bar(doc_viewer *v) {
             cur_col++;
         }
     }
+    for (size_t i = v->tab_count; i < MAX_TABS; i++) {
+        v->hit_boxes[i] = (tab_hit_box){0, 0, -1};
+    }
     if (cur_col <= v->term_cols) {
         printf("\033[48;5;234m\033[1;%dH\033[K\033[0m", cur_col);
     }
@@ -457,8 +498,8 @@ static void viewer_display_current_page(doc_viewer *v) {
     if (total_w_px <= 0) total_w_px = (int)((double)v->term_cols * v->cell_w_px + 0.5);
     if (total_h_px <= 0) total_h_px = (int)((double)v->term_rows * v->cell_h_px + 0.5);
 
-    int start_row = (v->tab_count > 1) ? 2 : 1;
-    int content_rows = (v->tab_count > 1) ? (v->term_rows - 1) : v->term_rows;
+    int start_row = 1;
+    int content_rows = v->term_rows;
     if (content_rows < 1) content_rows = 1;
     int content_h_px = (int)((double)content_rows * v->cell_h_px + 0.5);
     if (content_h_px <= 0) content_h_px = total_h_px;
@@ -585,14 +626,14 @@ static void viewer_display_current_page(doc_viewer *v) {
     term_gfx_clear(v->gfx);
     term_clear_screen();
 
-    if (v->tab_count > 1) {
-        viewer_render_tab_bar(v);
-    }
-
     char temp_png[PATH_MAX];
     snprintf(temp_png, sizeof(temp_png), "%s/view.png", v->temp_dir);
     (void)term_gfx_draw_pixmap(v->gfx, ctx, vpix, temp_png, 1, start_row, v->term_cols, content_rows, total_w_px, content_h_px);
     fz_drop_pixmap(ctx, vpix);
+
+    if (viewer_is_tab_bar_visible(v)) {
+        viewer_render_tab_bar(v);
+    }
 
     if (tab->current_links) { doc_free_page_links(tab->current_links, tab->current_links_count); tab->current_links = nullptr; }
     tab->current_links = doc_get_page_links(tab->doc, current_doc_page, &tab->current_links_count);
@@ -608,6 +649,7 @@ static void viewer_display_current_page(doc_viewer *v) {
 
 static void viewer_goto_page(doc_viewer *v, int page_idx) {
     if (v->tab_count == 0) return;
+    viewer_dismiss_hud(v);
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
     if (page_idx < 0) page_idx = 0;
     if (page_idx >= (int)tab->content_page_count) page_idx = (int)tab->content_page_count - 1;
@@ -619,12 +661,12 @@ static void viewer_goto_page(doc_viewer *v, int page_idx) {
     viewer_display_current_page(v);
 }
 
-static void viewer_handle_link_click(doc_viewer *v, int col, int row) {
-    if (v->tab_count == 0) return;
+static bool viewer_handle_link_click(doc_viewer *v, int col, int row) {
+    if (v->tab_count == 0) return false;
     viewer_tab *tab = &v->tabs[v->active_tab_idx];
-    if (!tab->current_links || tab->current_links_count == 0) return;
+    if (!tab->current_links || tab->current_links_count == 0) return false;
     if (col < tab->click_map.col_offset || col >= tab->click_map.col_offset + tab->click_map.width_chars ||
-        row < tab->click_map.row_offset || row >= tab->click_map.row_offset + tab->click_map.height_lines) return;
+        row < tab->click_map.row_offset || row >= tab->click_map.row_offset + tab->click_map.height_lines) return false;
 
     double norm_x = (double)(col - tab->click_map.col_offset) / (double)tab->click_map.width_chars;
     double norm_y = (double)(row - tab->click_map.row_offset) / (double)tab->click_map.height_lines;
@@ -648,14 +690,20 @@ static void viewer_handle_link_click(doc_viewer *v, int col, int row) {
                 char cmd[1024]; snprintf(cmd, sizeof(cmd), "xdg-open \"%s\" >/dev/null 2>&1 &", l->uri);
                 (void)system(cmd);
                 viewer_set_status(v, "Opened external link", 1500);
+                viewer_display_current_page(v);
+                return true;
             } else if (l->dest_page >= 0) {
                 for (size_t p = 0; p < tab->content_page_count; p++) {
-                    if (tab->content_pages[p] == l->dest_page) { viewer_goto_page(v, (int)p); return; }
+                    if (tab->content_pages[p] == l->dest_page) {
+                        viewer_goto_page(v, (int)p);
+                        return true;
+                    }
                 }
             }
-            break;
+            return true;
         }
     }
+    return false;
 }
 
 [[nodiscard]] doc_viewer *viewer_create(const char *path) {
@@ -732,6 +780,9 @@ void viewer_close_tab(doc_viewer *v, size_t index) {
     char closed_name[128] = {};
     if (v->tabs[index].display_name) snprintf(closed_name, sizeof(closed_name), "%s", v->tabs[index].display_name);
     viewer_tab_save_config(&v->tabs[index]);
+    if (v->cache && v->tabs[index].doc) {
+        cache_clear(v->cache, doc_get_context(v->tabs[index].doc));
+    }
     viewer_tab_free(&v->tabs[index]);
 
     for (size_t i = index; i + 1 < v->tab_count; i++) {
@@ -855,8 +906,9 @@ static void viewer_handle_ipc(doc_viewer *v) {
                 int total_w_px = 0, total_h_px = 0;
                 term_get_pixel_size(&total_w_px, &total_h_px);
                 if (total_w_px <= 0) total_w_px = (int)((double)v->term_cols * v->cell_w_px + 0.5);
-                int c_rows = (v->tab_count > 1) ? (v->term_rows - 1) : v->term_rows;
+                int c_rows = v->term_rows;
                 int c_h = (int)((double)c_rows * v->cell_h_px + 0.5);
+                if (c_h <= 0) c_h = total_h_px;
                 viewer_update_tab_layout(v, tab, total_w_px, c_h);
                 if (tab->page_pixel_heights && tab->page_y_starts && cur_p < (int)tab->content_page_count) {
                     tab->virtual_y = tab->page_y_starts[cur_p] + (int64_t)(frac * tab->page_pixel_heights[cur_p]);
@@ -978,7 +1030,7 @@ static void viewer_show_help(doc_viewer *v) {
     printf("\033[%d;6H\033[1mf\033[0m                       Toggle fit mode (Fit width / Fit height)\033[K\r\n", r++);
     printf("\033[%d;6H\033[1m+\033[0m    / \033[1m-\033[0m              Zoom in / out\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mD\033[0m                       Cycle tint (white / dim / dark / invert)\033[K\r\n", r++);
-    printf("\033[%d;6H\033[1mi\033[0m                       Show document info toast\033[K\r\n", r++);
+    printf("\033[%d;6H\033[1mi\033[0m                       Toggle document info & tab bar HUD\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mr\033[0m                       Refresh display & re-detect cell size\033[K\r\n", r++);
     printf("\033[%d;6H\033[1mq\033[0m                       Quit viewer\033[K\r\n", r++);
     r++;
@@ -1044,7 +1096,39 @@ static void viewer_show_help(doc_viewer *v) {
             }
         }
 
-        if (poll(pfds, n_pfds, 500) < 0) continue;
+        uint64_t now_before = get_time_ms();
+        int poll_timeout = 500;
+        uint64_t next_expire = 0;
+        if (v->tab_bar_until_ms > now_before) {
+            next_expire = v->tab_bar_until_ms;
+        }
+        if (v->status_until_ms > now_before) {
+            if (next_expire == 0 || v->status_until_ms < next_expire) {
+                next_expire = v->status_until_ms;
+            }
+        }
+        if (next_expire > now_before) {
+            int rem = (int)(next_expire - now_before) + 1;
+            if (rem < poll_timeout) poll_timeout = rem;
+        }
+
+        if (poll(pfds, n_pfds, poll_timeout) < 0) continue;
+
+        uint64_t now_after = get_time_ms();
+        bool hud_expired = false;
+        if (v->tab_bar_until_ms > 0 && now_after >= v->tab_bar_until_ms) {
+            v->tab_bar_until_ms = 0;
+            memset(v->hit_boxes, 0, sizeof(v->hit_boxes));
+            hud_expired = true;
+        }
+        if (v->status_until_ms > 0 && now_after >= v->status_until_ms) {
+            v->status_until_ms = 0;
+            v->status_msg[0] = '\0';
+            hud_expired = true;
+        }
+        if (hud_expired && !(pfds[0].revents & POLLIN)) {
+            viewer_display_current_page(v);
+        }
 
         if (pfds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
             break;
@@ -1066,8 +1150,7 @@ static void viewer_show_help(doc_viewer *v) {
             term_get_pixel_size(&total_w_px, &total_h_px);
             if (total_h_px <= 0) total_h_px = (int)((double)v->term_rows * v->cell_h_px + 0.5);
 
-            int content_h_px = (v->tab_count > 1) ? (int)((double)(v->term_rows - 1) * v->cell_h_px + 0.5) : total_h_px;
-            if (content_h_px <= 0) content_h_px = total_h_px;
+            int content_h_px = total_h_px;
 
             int step_pg = (int)((double)content_h_px * tab->scroll_ratio);
             if (step_pg < 80) step_pg = 80;
@@ -1154,50 +1237,61 @@ static void viewer_show_help(doc_viewer *v) {
                 v->want_back = true;
                 break;
             } else if (key == KEY_PAGE_DOWN || key == ' ' || key == 'd' || key == 4) {
+                viewer_dismiss_hud(v);
                 tab->virtual_y = (tab->virtual_y + step_pg <= tab->max_scroll_y) ? (tab->virtual_y + step_pg) : tab->max_scroll_y;
                 viewer_display_current_page(v);
             } else if (key == KEY_PAGE_UP || key == 'u' || key == 21) {
+                viewer_dismiss_hud(v);
                 tab->virtual_y = (tab->virtual_y >= step_pg) ? (tab->virtual_y - step_pg) : 0;
                 viewer_display_current_page(v);
             } else if (key == KEY_MOUSE_WHEEL_DOWN) {
-                if (v->tab_count > 1 && mouse_row == 1) {
-                    viewer_next_tab(v);
+                if (viewer_is_tab_bar_visible(v) && mouse_row == 1) {
+                    if (v->tab_count > 1) viewer_next_tab(v);
                 } else {
+                    viewer_dismiss_hud(v);
                     int wstep = (int)((double)content_h_px * 0.15);
                     if (wstep < 50) wstep = 50;
                     tab->virtual_y = (tab->virtual_y + wstep <= tab->max_scroll_y) ? (tab->virtual_y + wstep) : tab->max_scroll_y;
                     viewer_display_current_page(v);
                 }
             } else if (key == KEY_MOUSE_WHEEL_UP) {
-                if (v->tab_count > 1 && mouse_row == 1) {
-                    viewer_prev_tab(v);
+                if (viewer_is_tab_bar_visible(v) && mouse_row == 1) {
+                    if (v->tab_count > 1) viewer_prev_tab(v);
                 } else {
+                    viewer_dismiss_hud(v);
                     int wstep = (int)((double)content_h_px * 0.15);
                     if (wstep < 50) wstep = 50;
                     tab->virtual_y = (tab->virtual_y >= wstep) ? (tab->virtual_y - wstep) : 0;
                     viewer_display_current_page(v);
                 }
             } else if (key == KEY_ARROW_DOWN || key == 'j' || key == 'J') {
+                viewer_dismiss_hud(v);
                 tab->virtual_y = (tab->virtual_y + step_line <= tab->max_scroll_y) ? (tab->virtual_y + step_line) : tab->max_scroll_y;
                 viewer_display_current_page(v);
             } else if (key == KEY_ARROW_UP || key == 'k' || key == 'K') {
+                viewer_dismiss_hud(v);
                 tab->virtual_y = (tab->virtual_y >= step_line) ? (tab->virtual_y - step_line) : 0;
                 viewer_display_current_page(v);
             } else if (key == KEY_ARROW_RIGHT || key == 'n' || key == 'N') {
+                viewer_dismiss_hud(v);
                 viewer_goto_page(v, tab->current_page_idx + 1);
             } else if (key == KEY_ARROW_LEFT || key == 'p' || key == 'P') {
+                viewer_dismiss_hud(v);
                 viewer_goto_page(v, tab->current_page_idx - 1);
             } else if (key == '[') {
+                viewer_dismiss_hud(v);
                 tab->scroll_ratio = fmax(0.10, tab->scroll_ratio - 0.05);
                 char msg[64]; snprintf(msg, sizeof(msg), "Scroll step: %.0f%% screen", tab->scroll_ratio * 100.0);
                 viewer_set_status(v, msg, 1000);
                 viewer_display_current_page(v);
             } else if (key == ']') {
+                viewer_dismiss_hud(v);
                 tab->scroll_ratio = fmin(0.80, tab->scroll_ratio + 0.05);
                 char msg[64]; snprintf(msg, sizeof(msg), "Scroll step: %.0f%% screen", tab->scroll_ratio * 100.0);
                 viewer_set_status(v, msg, 1000);
                 viewer_display_current_page(v);
             } else if (key == 'g') {
+                viewer_dismiss_hud(v);
                 // Peek next key for Vim-style tab commands ('gt' -> next tab, 'gT' -> prev tab)
                 struct pollfd g_pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
                 char peek_buf[16] = {};
@@ -1246,17 +1340,18 @@ static void viewer_show_help(doc_viewer *v) {
                     viewer_display_current_page(v);
                 }
             } else if (key == 'f') {
+                viewer_dismiss_hud(v);
                 int cur_p = tab->current_page_idx;
                 tab->fit = (tab->fit == FIT_WIDTH) ? FIT_HEIGHT : FIT_WIDTH;
-                int start_r = (v->tab_count > 1) ? 2 : 1;
-                int c_rows = (v->tab_count > 1) ? (v->term_rows - 1) : v->term_rows;
+                int c_rows = v->term_rows;
                 int c_h = (int)((double)c_rows * v->cell_h_px + 0.5);
+                if (c_h <= 0) c_h = total_h_px;
                 viewer_update_tab_layout(v, tab, total_w_px, c_h);
                 if (tab->page_y_starts) tab->virtual_y = tab->page_y_starts[cur_p];
                 viewer_set_status(v, (tab->fit == FIT_WIDTH) ? "Fit: width (continuous scroll)" : "Fit: height (fit page)", 1200);
                 viewer_display_current_page(v);
-                (void)start_r;
             } else if (key == '+' || key == '=') {
+                viewer_dismiss_hud(v);
                 int cur_p = tab->current_page_idx;
                 double frac = 0.0;
                 if (tab->page_pixel_heights && tab->page_y_starts && cur_p < (int)tab->content_page_count && tab->page_pixel_heights[cur_p] > 0) {
@@ -1265,8 +1360,9 @@ static void viewer_show_help(doc_viewer *v) {
                     if (frac > 1.0) frac = 1.0;
                 }
                 tab->zoom = fmin(tab->zoom + 0.1, MAX_ZOOM);
-                int c_rows = (v->tab_count > 1) ? (v->term_rows - 1) : v->term_rows;
+                int c_rows = v->term_rows;
                 int c_h = (int)((double)c_rows * v->cell_h_px + 0.5);
+                if (c_h <= 0) c_h = total_h_px;
                 viewer_update_tab_layout(v, tab, total_w_px, c_h);
                 if (tab->page_pixel_heights && tab->page_y_starts && cur_p < (int)tab->content_page_count) {
                     tab->virtual_y = tab->page_y_starts[cur_p] + (int64_t)(frac * tab->page_pixel_heights[cur_p]);
@@ -1277,6 +1373,7 @@ static void viewer_show_help(doc_viewer *v) {
                 viewer_set_status(v, zbuf, 1000);
                 viewer_display_current_page(v);
             } else if (key == '-' || key == '_') {
+                viewer_dismiss_hud(v);
                 int cur_p = tab->current_page_idx;
                 double frac = 0.0;
                 if (tab->page_pixel_heights && tab->page_y_starts && cur_p < (int)tab->content_page_count && tab->page_pixel_heights[cur_p] > 0) {
@@ -1285,8 +1382,9 @@ static void viewer_show_help(doc_viewer *v) {
                     if (frac > 1.0) frac = 1.0;
                 }
                 tab->zoom = fmax(tab->zoom - 0.1, MIN_ZOOM);
-                int c_rows = (v->tab_count > 1) ? (v->term_rows - 1) : v->term_rows;
+                int c_rows = v->term_rows;
                 int c_h = (int)((double)c_rows * v->cell_h_px + 0.5);
+                if (c_h <= 0) c_h = total_h_px;
                 viewer_update_tab_layout(v, tab, total_w_px, c_h);
                 if (tab->page_pixel_heights && tab->page_y_starts && cur_p < (int)tab->content_page_count) {
                     tab->virtual_y = tab->page_y_starts[cur_p] + (int64_t)(frac * tab->page_pixel_heights[cur_p]);
@@ -1297,18 +1395,19 @@ static void viewer_show_help(doc_viewer *v) {
                 viewer_set_status(v, zbuf, 1000);
                 viewer_display_current_page(v);
             } else if (key == 'D') {
+                viewer_dismiss_hud(v);
                 tab->tint = (tint_mode)(((unsigned)tab->tint + 1) % 4);
                 char tbuf[64]; snprintf(tbuf, sizeof(tbuf), "Tint: %s", (tab->tint == TINT_DARK) ? "dark" : ((tab->tint == TINT_DIM) ? "dim" : ((tab->tint == TINT_INVERT) ? "invert" : "white")));
                 viewer_set_status(v, tbuf, 1000);
                 viewer_display_current_page(v);
             } else if (key == 'i') {
-                char ibuf[256];
-                int curr_p = (tab->content_pages && tab->current_page_idx < (int)tab->content_page_count) ? tab->content_pages[tab->current_page_idx] + 1 : 1;
-                snprintf(ibuf, sizeof(ibuf), "[%zu/%zu] %s | Page %d/%zu (%d) | Zoom %.0f%% | Fit %s",
-                         v->active_tab_idx + 1, v->tab_count, tab->display_name, tab->current_page_idx + 1,
-                         tab->content_page_count, curr_p, tab->zoom * 100.0, viewer_fit_name(tab->fit));
-                viewer_set_status(v, ibuf, 2500);
+                viewer_toggle_hud(v);
                 viewer_display_current_page(v);
+            } else if (key == KEY_ESC || key == 27) {
+                if (viewer_is_tab_bar_visible(v) || (get_time_ms() < v->status_until_ms)) {
+                    viewer_dismiss_hud(v);
+                    viewer_display_current_page(v);
+                }
             } else if (key == 'T') {
                 if (tab->toc && tab->toc_count > 0) {
                     int cur_doc_p = tab->content_pages ? tab->content_pages[tab->current_page_idx] : 0;
@@ -1340,7 +1439,7 @@ static void viewer_show_help(doc_viewer *v) {
             } else if (key == KEY_MOUSE_LEFT || key == KEY_MOUSE_CTRL_CLICK) {
                 term_log_keystroke("ACTION: Mouse click at col=%d, row=%d (tab_count=%zu, active_tab=%zu)",
                                    mouse_col, mouse_row, v->tab_count, v->active_tab_idx + 1);
-                if (v->tab_count > 1 && mouse_row == 1) {
+                if (viewer_is_tab_bar_visible(v) && mouse_row == 1) {
                     bool hit = false;
                     for (size_t i = 0; i < v->tab_count; i++) {
                         if (mouse_col >= v->hit_boxes[i].start_col && mouse_col <= v->hit_boxes[i].end_col) {
@@ -1350,6 +1449,7 @@ static void viewer_show_help(doc_viewer *v) {
                                 mouse_col <= v->hit_boxes[i].close_col + 1) {
                                 term_log_keystroke("ACTION: Clicked [x] to close tab %zu (\"%s\")", i + 1, v->tabs[i].display_name);
                                 viewer_close_tab(v, i);
+                                if (v->tab_count == 0) break;
                             } else {
                                 term_log_keystroke("ACTION: Clicked tab label to switch to tab %zu (\"%s\")", i + 1, v->tabs[i].display_name);
                                 viewer_switch_tab(v, i);
@@ -1357,11 +1457,17 @@ static void viewer_show_help(doc_viewer *v) {
                             break;
                         }
                     }
+                    if (v->tab_count == 0) break;
                     if (!hit) {
                         term_log_keystroke("ACTION: Mouse click on row 1 was outside tab labels");
                     }
                 } else {
-                    viewer_handle_link_click(v, mouse_col, mouse_row);
+                    bool hud_was_active = viewer_is_tab_bar_visible(v) || (get_time_ms() < v->status_until_ms);
+                    viewer_dismiss_hud(v);
+                    bool link_hit = viewer_handle_link_click(v, mouse_col, mouse_row);
+                    if (hud_was_active && !link_hit) {
+                        viewer_display_current_page(v);
+                    }
                 }
             }
             PROFILE_END("viewer", "viewer_handle_key");

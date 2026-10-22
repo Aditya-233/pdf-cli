@@ -8,3 +8,4 @@ depends/libtermkey/
 depends/termbox2/
 trace.json
 *.trace
+.agents/

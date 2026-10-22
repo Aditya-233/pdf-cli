@@ -23,6 +23,9 @@ void viewer_next_tab(doc_viewer *v);
 void viewer_prev_tab(doc_viewer *v);
 [[nodiscard]] size_t viewer_get_tab_count(const doc_viewer *v);
 [[nodiscard]] size_t viewer_get_active_tab(const doc_viewer *v);
+[[nodiscard]] bool viewer_is_tab_bar_visible(const doc_viewer *v);
+void viewer_toggle_hud(doc_viewer *v);
+void viewer_dismiss_hud(doc_viewer *v);
 
 // Runs the main interactive viewer loop.
 // Returns true if the user requested going back to the file picker ('b'), false on quit ('q' or Ctrl+C).

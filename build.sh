@@ -62,6 +62,11 @@ do_test() {
     ./"$BINARY" --help > /dev/null
     ./dvctl presets > /dev/null
     echo "===> Smoke tests passed: $BINARY is operational!"
+    echo ""
+    if [[ -f "tests/test_hud.c" ]]; then
+        $CC $CFLAGS $INCLUDES tests/test_hud.c "${OBJS[@]:1}" $LIBS -o "$BUILD_DIR/test_hud"
+        "$BUILD_DIR/test_hud"
+    fi
 }
 
 do_clean() {
