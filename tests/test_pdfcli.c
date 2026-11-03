@@ -50,7 +50,7 @@ int main(void) {
     pdf_close(NULL);
     fz_rect empty_b = pdf_page_bounds(NULL, 0);
     assert(empty_b.x0 == 0 && empty_b.x1 == 0);
-    assert(!pdf_render_page_slice(NULL, 0, 1.0, 0, 0, 100, 100, NULL, 0, 0, false));
+    assert(pdf_render_viewport(NULL, 0, 1.0, 0, 100, 100, false) == NULL);
     size_t toc_cnt = 99;
     assert(pdf_get_toc(NULL, &toc_cnt) == NULL && toc_cnt == 0);
     pdf_free_toc(NULL, 0);
@@ -70,46 +70,24 @@ int main(void) {
     assert(b1.y1 - b1.y0 > 700.0f);
     printf(" PASSED\n");
 
-    // Test 3: Continuous Multi-Page Composite Slicing
-    printf("  [TEST 3] Continuous multi-page composite slice rendering...");
+    // Test 3: Viewport Rendering with Scroll Y
+    printf("  [TEST 3] Viewport rendering with scroll_y...");
     fflush(stdout);
     int vw = 800, vh = 600;
-    fz_pixmap *comp = fz_new_pixmap_with_bbox(doc->ctx, fz_device_rgb(doc->ctx), fz_make_irect(0, 0, vw, vh), NULL, 0);
-    assert(comp != NULL);
-    fz_clear_pixmap_with_value(doc->ctx, comp, 0x18);
-
-    // Page 0 bottom slice (height 300) into top of comp (dst_y = 0)
-    bool ok0 = pdf_render_page_slice(doc, 0, 1.0, 0, 400, vw, 300, comp, 0, 0, false);
-    assert(ok0 == true);
-
-    // Page 1 top slice (height 280) into bottom of comp (dst_y = 320, 20px gap)
-    bool ok1 = pdf_render_page_slice(doc, 1, 1.0, 0, 0, vw, 280, comp, 0, 320, false);
-    assert(ok1 == true);
-
-    // Verify samples exist and were rendered
-    assert(comp->samples != NULL);
-    // Page 0 white background in comp should be 255
-    assert(comp->samples[0] == 255);
-    // Gap area between dst_y 300 and 320 should have background value 0x18
-    unsigned char *gap_sample = comp->samples + (ptrdiff_t)310 * comp->stride;
-    assert(gap_sample[0] == 0x18);
-    // Page 1 white background at dst_y 320 should be 255
-    unsigned char *p1_sample = comp->samples + (ptrdiff_t)325 * comp->stride;
-    assert(p1_sample[0] == 255);
-
+    fz_pixmap *pix = pdf_render_viewport(doc, 0, 1.0, 100, vw, vh, false);
+    assert(pix != NULL);
+    assert(pix->w == vw && pix->h == vh);
+    assert(pix->samples != NULL);
     printf(" PASSED\n");
 
-    // Test 4: Dark Mode Pixel Inversion on Slices
-    printf("  [TEST 4] Dark mode slice pixel inversion correctness...");
+    // Test 4: Dark Mode Pixel Inversion on Viewport
+    printf("  [TEST 4] Dark mode pixel inversion correctness...");
     fflush(stdout);
-    fz_pixmap *comp_dark = fz_new_pixmap_with_bbox(doc->ctx, fz_device_rgb(doc->ctx), fz_make_irect(0, 0, 100, 100), NULL, 0);
-    assert(comp_dark != NULL);
-    fz_clear_pixmap_with_value(doc->ctx, comp_dark, 0x12);
-    bool ok_dark = pdf_render_page_slice(doc, 0, 1.0, 0, 0, 100, 100, comp_dark, 0, 0, true);
-    assert(ok_dark == true);
+    fz_pixmap *pix_dark = pdf_render_viewport(doc, 0, 1.0, 0, 100, 100, true);
+    assert(pix_dark != NULL);
     // Inverted white background should be 0 (black)
-    assert(comp_dark->samples[0] == 0);
-    fz_drop_pixmap(doc->ctx, comp_dark);
+    assert(pix_dark->samples[0] == 0);
+    fz_drop_pixmap(doc->ctx, pix_dark);
     printf(" PASSED\n");
 
     // Test 5: In-Document Text Search
@@ -126,18 +104,18 @@ int main(void) {
     printf(" PASSED\n");
 
     // Test 6: Sixel Graphics Pipeline Output
-    printf("  [TEST 6] Sixel encoding pipeline on composite pixmap...");
+    printf("  [TEST 6] Sixel encoding pipeline on rendered viewport...");
     fflush(stdout);
     int saved_stdout = dup(STDOUT_FILENO);
     FILE *devnull = fopen("/dev/null", "w");
     dup2(fileno(devnull), STDOUT_FILENO);
-    bool sixel_ok = sixel_draw(comp, 1, 1);
+    bool sixel_ok = sixel_draw(pix, 1, 1);
     fflush(stdout);
     dup2(saved_stdout, STDOUT_FILENO);
     close(saved_stdout);
     fclose(devnull);
     assert(sixel_ok == true);
-    fz_drop_pixmap(doc->ctx, comp);
+    fz_drop_pixmap(doc->ctx, pix);
     printf(" PASSED\n");
 
     pdf_close(doc);

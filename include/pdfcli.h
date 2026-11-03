@@ -53,7 +53,7 @@ typedef struct {
 [[nodiscard]] pdf_doc_t *pdf_open(const char *path);
 void pdf_close(pdf_doc_t *doc);
 [[nodiscard]] fz_rect pdf_page_bounds(pdf_doc_t *doc, int page);
-bool pdf_render_page_slice(pdf_doc_t *doc, int page, double scale, int sx, int sy, int vw, int vh, fz_pixmap *dst, int dst_x, int dst_y, bool dark);
+[[nodiscard]] fz_pixmap *pdf_render_viewport(pdf_doc_t *doc, int page, double scale, int scroll_y, int vw, int vh, bool dark);
 [[nodiscard]] toc_item_t *pdf_get_toc(pdf_doc_t *doc, size_t *out_count);
 void pdf_free_toc(toc_item_t *items, size_t count);
 [[nodiscard]] int *pdf_search_text(pdf_doc_t *doc, const char *needle, size_t *out_count);
