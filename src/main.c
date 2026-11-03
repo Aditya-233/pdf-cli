@@ -1,272 +1,473 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-
-#include <stdio.h>
-#include <stdlib.h>
+#include "pdfcli.h"
 #include <string.h>
 #include <libgen.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <limits.h>
 #include <signal.h>
-#if defined(__linux__)
-#include <malloc.h>
-#include <sys/prctl.h>
-#endif
+#include <unistd.h>
+#include <ctype.h>
 
-#include "pdfcli/types.h"
-#include "pdfcli/ctl_client.h"
-#include "pdfcli/viewer.h"
-#include "pdfcli/file_search.h"
-#include "pdfcli/picker.h"
-#include "pdfcli/menu.h"
-#include "pdfcli/term_raw.h"
-#include "pdfcli/profile.h"
+typedef struct {
+    char *path;
+    char *name;
+    pdf_doc_t *doc;
+    int page;
+    int scroll_y;
+    int max_scroll;
+    double zoom;
+    fit_mode_t fit;
+    bool dark;
+    char search_query[64];
+    int *search_hits;
+    size_t search_hit_count;
+    size_t search_hit_idx;
+} tab_t;
 
-static void print_help(void) {
-    puts("pdf-cli (C23) - Terminal-based document viewer\n\n"
-         "USAGE: pdf-cli [OPTIONS] [PATH...]  |  dvctl [OPTIONS] [COMMAND] ...\n"
-         "ARGUMENTS: [PATH...] One or more files or directory to open in tabs\n"
-         "OPTIONS:\n"
-         "  -h, --help     Show help\n"
-         "  -v, --version  Show version\n"
-         "  --profile      Enable latency & memory profiling (flushes trace.json on exit)\n"
-         "  ctl ...        Control running viewers (see: pdf-cli ctl help)\n\n"
-         "TAB NAVIGATION:\n"
-         "  1 .. 9                       Switch directly to tab 1 through 9 (when multiple tabs)\n"
-         "  Ctrl+1 .. Ctrl+9 (Alt+1..9) Switch directly to tab 1 through 9\n"
-         "  Ctrl+0           (Alt+0)     Switch to tab 10 / last tab\n"
-         "  Ctrl+Tab / gt                Cycle to next tab\n"
-         "  Ctrl+Shift+Tab / gT          Cycle to previous tab\n"
-         "  Ctrl+T                       Open document in new tab\n"
-         "  Ctrl+W                       Close current tab\n"
-         "  Mouse Left on Tab Bar        Click tab to switch / click × to close\n"
-         "  Mouse Wheel on Tab Bar       Cycle through tabs\n\n"
-         "KEYBOARD SHORTCUTS:\n"
-         "  PgDn, Space, d Smooth scroll down (screen)\n"
-         "  PgUp, u        Smooth scroll up (screen)\n"
-         "  j, Down        Scroll down (line)\n"
-         "  k, Up          Scroll up (line)\n"
-         "  Right, n       Next page\n"
-         "  Left, p        Previous page\n"
-         "  g              Jump to specific page number (or 'gt'/'gT' for tabs)\n"
-         "  f              Cycle fit modes (fit-width continuous / fit-height)\n"
-         "  D              Cycle tint (white/dim/dark/invert)\n"
-         "  T              Table of contents modal\n"
-         "  +, -           Zoom in / out\n"
-         "  i              Toggle document info & tab bar HUD\n"
-         "  b              Back to file picker\n"
-         "  q              Quit\n");
+static volatile sig_atomic_t s_interrupted = 0;
+static void on_signal(int sig) { (void)sig; s_interrupted = 1; }
+
+static const char *get_base_name(const char *path) {
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
 }
 
-static char *expand_path(const char *path) {
-    if (!path) return nullptr;
-    if (path[0] == '~' && path[1] == '/') {
-        const char *h = getenv("HOME");
-        if (h) {
-            char buf[PATH_MAX];
-            snprintf(buf, sizeof(buf), "%s/%s", h, path + 2);
-            return strdup(buf);
+static void render_status_bar(const tab_t *t, int tab_idx, int tab_total, int rows, const char *extra_msg) {
+    printf("\033[%d;1H\033[7m", rows);
+    if (extra_msg && extra_msg[0]) {
+        printf(" %s\033[0m\033[K", extra_msg);
+    } else {
+        printf(" [%d/%d] %s | Page %d/%d | Zoom %.0f%% | Fit: %s%s",
+               tab_idx + 1, tab_total, t->name, t->page + 1, t->doc->page_count,
+               t->zoom * 100.0, t->fit == FIT_WIDTH ? "Width" : "Page",
+               t->dark ? " | Dark" : "");
+        if (t->search_hit_count > 0) {
+            printf(" | Search [%zu/%zu]: \"%s\"",
+                   t->search_hit_idx + 1, t->search_hit_count, t->search_query);
         }
+        printf(" \033[0m\033[K");
     }
-    struct stat st;
-    if (stat(path, &st) == 0) return strdup(path);
-
-    // Fallback: check if relative to $HOME
-    const char *h = getenv("HOME");
-    if (h && path[0] != '/') {
-        char buf[PATH_MAX];
-        snprintf(buf, sizeof(buf), "%s/%s", h, path);
-        if (stat(buf, &st) == 0) return strdup(buf);
-    }
-    return strdup(path);
+    fflush(stdout);
 }
 
-static bool run_viewer_loop(const char *initial_path, const char *search_dir) {
-    char *cur = strdup(initial_path);
-    while (cur) {
-        struct stat st;
-        if (stat(cur, &st) != 0 || S_ISDIR(st.st_mode)) {
-            file_list *files = file_search_dir(cur);
-            if (!files || files->count == 0) {
-                printf("No supported documents found in %s\n", cur);
-                if (files) file_list_free(files);
-                free(cur);
-                return true;
+static void render_tab_bar(const tab_t *tabs, int tab_count, int active_tab, int cols) {
+    printf("\033[1;1H\033[2m\033[K"); // Clear row 1
+    int cur_col = 1;
+    for (int i = 0; i < tab_count && cur_col < cols - 8; i++) {
+        bool is_act = (i == active_tab);
+        char label[64];
+        snprintf(label, sizeof(label), " %d: %.16s%s ", i + 1, tabs[i].name, is_act ? "*" : "");
+        if (is_act) printf("\033[1;7m%s\033[0m\033[2m", label);
+        else printf("\033[0;2m%s\033[0m\033[2m", label);
+        cur_col += (int)strlen(label);
+    }
+    printf("\033[0m");
+    fflush(stdout);
+}
+
+static void render_frame(tab_t *tabs, int tab_count, int active_tab, const char *extra_msg) {
+    if (tab_count <= 0 || active_tab < 0 || active_tab >= tab_count) return;
+    tab_t *t = &tabs[active_tab];
+
+    int cols = 0, rows = 0, px_w = 0, px_h = 0;
+    term_get_size(&cols, &rows, &px_w, &px_h);
+
+    bool show_tabs = (tab_count > 1);
+    int content_start_row = show_tabs ? 2 : 1;
+    int content_rows = rows - (show_tabs ? 2 : 1);
+    if (content_rows < 1) content_rows = 1;
+
+    double cell_h = (double)px_h / (double)rows;
+    int content_h_px = (int)((double)content_rows * cell_h + 0.5);
+
+    fz_rect b = pdf_page_bounds(t->doc, t->page);
+    float pw = (b.x1 > b.x0) ? (b.x1 - b.x0) : 612.0f;
+    float ph = (b.y1 > b.y0) ? (b.y1 - b.y0) : 792.0f;
+
+    double base_scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) : ((double)content_h_px / (double)ph);
+    double scale = base_scale * t->zoom;
+    int total_page_h = (int)(ph * scale + 0.5);
+
+    t->max_scroll = (total_page_h > content_h_px) ? (total_page_h - content_h_px) : 0;
+    if (t->scroll_y > t->max_scroll) t->scroll_y = t->max_scroll;
+    if (t->scroll_y < 0) t->scroll_y = 0;
+
+    fz_pixmap *pix = pdf_render_viewport(t->doc, t->page, scale, t->scroll_y, px_w, content_h_px, t->dark);
+    if (pix) {
+        sixel_draw(pix, 1, content_start_row);
+        fz_drop_pixmap(t->doc->ctx, pix);
+    }
+
+    if (show_tabs) render_tab_bar(tabs, tab_count, active_tab, cols);
+    render_status_bar(t, active_tab, tab_count, rows, extra_msg);
+}
+
+static int calc_page_max_scroll(const tab_t *t, int page_idx, int px_w, int content_h_px) {
+    fz_rect b = pdf_page_bounds(t->doc, page_idx);
+    float pw = (b.x1 > b.x0) ? (b.x1 - b.x0) : 612.0f;
+    float ph = (b.y1 > b.y0) ? (b.y1 - b.y0) : 792.0f;
+    double base_scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) : ((double)content_h_px / (double)ph);
+    double scale = base_scale * t->zoom;
+    int page_h = (int)(ph * scale + 0.5);
+    return (page_h > content_h_px) ? (page_h - content_h_px) : 0;
+}
+
+static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab) {
+    tab_t *t = &tabs[active_tab];
+    size_t toc_cnt = 0;
+    toc_item_t *toc = pdf_get_toc(t->doc, &toc_cnt);
+    if (!toc || toc_cnt == 0) {
+        render_frame(tabs, tab_count, active_tab, "Document has no Table of Contents");
+        pdf_free_toc(toc, toc_cnt);
+        return;
+    }
+
+    int cols = 0, rows = 0;
+    term_get_size(&cols, &rows, nullptr, nullptr);
+    int top = 3, bottom = rows - 2;
+    int max_visible = bottom - top + 1;
+    if (max_visible < 3) { pdf_free_toc(toc, toc_cnt); return; }
+
+    int sel = 0, offset = 0;
+    for (size_t i = 0; i < toc_cnt; i++) {
+        if (toc[i].page >= t->page) { sel = (int)i; break; }
+    }
+
+    while (!s_interrupted) {
+        if (sel < offset) offset = sel;
+        if (sel >= offset + max_visible) offset = sel - max_visible + 1;
+
+        printf("\033[%d;1H\033[1;7m === Table of Contents (Enter: jump, q/Esc: cancel) ===\033[0m\033[K", top - 1);
+        for (int i = 0; i < max_visible; i++) {
+            int idx = offset + i;
+            printf("\033[%d;1H", top + i);
+            if (idx < (int)toc_cnt) {
+                bool is_sel = (idx == sel);
+                int indent = (toc[idx].level - 1) * 2;
+                if (indent > 12) indent = 12;
+                if (is_sel) printf("\033[7m > %*s%-*.*s (p. %d)\033[0m\033[K",
+                                   indent, "", cols - indent - 16, cols - indent - 16,
+                                   toc[idx].title, toc[idx].page + 1);
+                else printf("   %*s%-*.*s (p. %d)\033[K",
+                            indent, "", cols - indent - 16, cols - indent - 16,
+                            toc[idx].title, toc[idx].page + 1);
+            } else {
+                printf("\033[K");
             }
-            char *sel = picker_run(files);
-            file_list_free(files);
-            if (!sel) { free(cur); return true; }
-            free(cur);
-            cur = sel;
         }
+        fflush(stdout);
 
-        doc_viewer *v = viewer_create(cur);
-        if (!v || !viewer_open(v)) {
-            printf("Error opening file: %s\n", cur);
-            if (v) viewer_destroy(v);
-            free(cur);
-            return false;
+        int k = term_read_key(500);
+        if (k == KEY_NONE) continue;
+        if (k == 'q' || k == KEY_ESC || k == KEY_CTRL_C) break;
+        if (k == 'j' || k == KEY_DOWN || k == KEY_WHEEL_DOWN) {
+            if (sel < (int)toc_cnt - 1) sel++;
+        } else if (k == 'k' || k == KEY_UP || k == KEY_WHEEL_UP) {
+            if (sel > 0) sel--;
+        } else if (k == KEY_PGDN) {
+            sel = (sel + max_visible < (int)toc_cnt) ? (sel + max_visible) : (int)toc_cnt - 1;
+        } else if (k == KEY_PGUP) {
+            sel = (sel >= max_visible) ? (sel - max_visible) : 0;
+        } else if (k == '\r' || k == '\n') {
+            t->page = toc[sel].page;
+            t->scroll_y = 0;
+            break;
         }
-
-        bool want_back = viewer_run(v);
-        viewer_destroy(v);
-        if (!want_back) { free(cur); return false; }
-
-        file_list *files = file_search_dir(search_dir);
-        if (!files || files->count == 0) {
-            if (files) file_list_free(files);
-            free(cur);
-            return true;
-        }
-        char *sel = picker_run(files);
-        file_list_free(files);
-        if (!sel) { free(cur); return true; }
-        free(cur);
-        cur = sel;
     }
-    return true;
+    pdf_free_toc(toc, toc_cnt);
+    render_frame(tabs, tab_count, active_tab, nullptr);
 }
 
-static void profile_signal_handler(int sig) {
-    (void)sig;
-    profile_shutdown();
-    _exit(0);
+static void show_search_prompt(tab_t *tabs, int tab_count, int active_tab) {
+    tab_t *t = &tabs[active_tab];
+    int cols = 0, rows = 0;
+    term_get_size(&cols, &rows, nullptr, nullptr);
+    (void)cols;
+
+    char query[64] = {0};
+    size_t qlen = 0;
+
+    (void)write(STDOUT_FILENO, "\033[?25h", 6); // Show cursor for prompt
+    while (!s_interrupted) {
+        printf("\033[%d;1H\033[7m /Search: %s\033[0m\033[K", rows, query);
+        fflush(stdout);
+        int ch = term_read_key(500);
+        if (ch == KEY_NONE) continue;
+        if (ch == KEY_ESC || ch == KEY_CTRL_C) {
+            (void)write(STDOUT_FILENO, "\033[?25l", 6);
+            render_frame(tabs, tab_count, active_tab, nullptr);
+            return;
+        }
+        if (ch == '\r' || ch == '\n') break;
+        if (ch == 127 || ch == 8) {
+            if (qlen > 0) query[--qlen] = '\0';
+        } else if (isprint(ch) && qlen < sizeof(query) - 1) {
+            query[qlen++] = (char)ch;
+            query[qlen] = '\0';
+        }
+    }
+    (void)write(STDOUT_FILENO, "\033[?25l", 6);
+
+    if (qlen == 0) {
+        render_frame(tabs, tab_count, active_tab, nullptr);
+        return;
+    }
+
+    snprintf(t->search_query, sizeof(t->search_query), "%s", query);
+    free(t->search_hits);
+    t->search_hits = pdf_search_text(t->doc, query, &t->search_hit_count);
+    t->search_hit_idx = 0;
+
+    if (t->search_hit_count == 0) {
+        render_frame(tabs, tab_count, active_tab, "No occurrences found");
+        return;
+    }
+
+    // Find first hit on or after current page
+    for (size_t i = 0; i < t->search_hit_count; i++) {
+        if (t->search_hits[i] >= t->page) {
+            t->search_hit_idx = i;
+            break;
+        }
+    }
+    t->page = t->search_hits[t->search_hit_idx];
+    t->scroll_y = 0;
+    render_frame(tabs, tab_count, active_tab, nullptr);
+}
+
+static void show_page_jump_prompt(tab_t *tabs, int tab_count, int active_tab) {
+    tab_t *t = &tabs[active_tab];
+    int cols = 0, rows = 0;
+    term_get_size(&cols, &rows, nullptr, nullptr);
+    (void)cols;
+
+    char num[16] = {0};
+    size_t nlen = 0;
+    (void)write(STDOUT_FILENO, "\033[?25h", 6);
+
+    while (!s_interrupted) {
+        printf("\033[%d;1H\033[7m Go to page (1-%d): %s\033[0m\033[K", rows, t->doc->page_count, num);
+        fflush(stdout);
+        int ch = term_read_key(500);
+        if (ch == KEY_NONE) continue;
+        if (ch == KEY_ESC || ch == KEY_CTRL_C) break;
+        if (ch == '\r' || ch == '\n') {
+            if (nlen > 0) {
+                int p = atoi(num);
+                if (p >= 1 && p <= t->doc->page_count) {
+                    t->page = p - 1;
+                    t->scroll_y = 0;
+                }
+            }
+            break;
+        }
+        if (ch == 127 || ch == 8) {
+            if (nlen > 0) num[--nlen] = '\0';
+        } else if (isdigit(ch) && nlen < sizeof(num) - 1) {
+            num[nlen++] = (char)ch;
+            num[nlen] = '\0';
+        }
+    }
+    (void)write(STDOUT_FILENO, "\033[?25l", 6);
+    render_frame(tabs, tab_count, active_tab, nullptr);
 }
 
 int main(int argc, char **argv) {
-    signal(SIGPIPE, SIG_IGN);
-#if defined(__linux__)
-#if defined(PR_SET_THP_DISABLE)
-    (void)prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-#endif
-    mallopt(M_ARENA_MAX, 1);
-    mallopt(M_MMAP_THRESHOLD, 64 * 1024);
-    mallopt(M_TRIM_THRESHOLD, 64 * 1024);
-#endif
-
-    bool profile_flag = false;
-    const char *env_prof = getenv("PDFCLI_PROFILE");
-    if (env_prof && (strcmp(env_prof, "1") == 0 || strcasecmp(env_prof, "true") == 0)) {
-        profile_flag = true;
-    }
-
-    int new_argc = 0;
-    char **new_argv = (char **)malloc((size_t)(argc + 1) * sizeof(char *));
-    if (new_argv) {
-        for (int i = 0; i < argc; i++) {
-            if (strcmp(argv[i], "--profile") == 0) {
-                profile_flag = true;
-            } else {
-                new_argv[new_argc++] = argv[i];
-            }
-        }
-        new_argv[new_argc] = nullptr;
-        argc = new_argc;
-        argv = new_argv;
-    }
-
-    profile_init(profile_flag, "trace.json");
-    if (profile_is_enabled()) {
-        atexit(profile_shutdown);
-        signal(SIGINT, profile_signal_handler);
-        signal(SIGTERM, profile_signal_handler);
-        signal(SIGQUIT, profile_signal_handler);
-        signal(SIGUSR1, profile_signal_handler);
-    }
-
-    if (strcmp(basename(argv[0]), "dvctl") == 0) return ctl_client_main(argc, argv);
-    if (argc > 1 && strcmp(argv[1], "ctl") == 0) return ctl_client_main(argc - 1, argv + 1);
-    if (argc > 1) {
-        if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) { print_help(); return 0; }
-        if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-v") == 0) {
-            puts("pdf-cli v.3.0 (C23 ISO/IEC 9899:2024)");
-            return 0;
-        }
-    }
-
-    if (argc <= 1) {
-        while (true) {
-            menu_result res = menu_run();
-            term_clear_screen();
-            if (res.choice == MENU_QUIT) return 0;
-            if (res.choice == MENU_BROWSE) {
-                file_list *files = file_search_broad();
-                if (!files || files->count == 0) {
-                    printf("No supported documents found. Press Enter...");
-                    getchar();
-                    if (files) file_list_free(files);
-                    continue;
-                }
-                char *sel = picker_run(files);
-                file_list_free(files);
-                if (!sel) continue;
-                char *pc = strdup(sel), *dir = strdup(dirname(pc));
-                free(pc);
-                bool cont = run_viewer_loop(sel, dir);
-                free(sel); free(dir);
-                if (!cont) return 0;
-            } else if (res.choice == MENU_ENTER_DIR && res.dir_path[0]) {
-                char *exp = expand_path(res.dir_path);
-                struct stat st;
-                if (stat(exp, &st) != 0) {
-                    printf("\n  Not found: %s\n  Press Enter...\n", exp);
-                    getchar();
-                    free(exp);
-                    continue;
-                }
-                char *dir = S_ISDIR(st.st_mode) ? strdup(exp) : strdup(dirname(strdup(exp)));
-                bool cont = run_viewer_loop(exp, dir);
-                free(exp); free(dir);
-                if (!cont) return 0;
-            }
-        }
-    }
-
-    if (argc > 2) {
-        char *first_exp = expand_path(argv[1]);
-        struct stat st;
-        if (stat(first_exp, &st) != 0 || S_ISDIR(st.st_mode)) {
-            printf("Path not found: %s\n", first_exp);
-            free(first_exp);
-            return 1;
-        }
-        doc_viewer *v = viewer_create(first_exp);
-        free(first_exp);
-        if (!v || !viewer_open(v)) {
-            printf("Error opening file: %s\n", argv[1]);
-            if (v) viewer_destroy(v);
-            return 1;
-        }
-        for (int i = 2; i < argc; i++) {
-            char *next_exp = expand_path(argv[i]);
-            if (next_exp) {
-                (void)viewer_add_tab(v, next_exp);
-                free(next_exp);
-            }
-        }
-        viewer_set_active_tab(v, 0);
-        (void)viewer_run(v);
-        viewer_destroy(v);
-        profile_shutdown();
-        if (new_argv) free(new_argv);
+    if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
+        puts("pdf-cli (C23) - Fast Sixel Terminal PDF Viewer\n\n"
+             "Usage: pdf-cli [options] <file1.pdf> [file2.pdf ...]\n\n"
+             "Navigation:\n"
+             "  j, Down, Space, PgDn   Scroll down / Next page\n"
+             "  k, Up, PgUp            Scroll up / Previous page\n"
+             "  WheelUp, WheelDown     Mouse wheel continuous scroll\n"
+             "  n, p                   Next / Previous page (or search match)\n"
+             "  g                      Jump to page number\n"
+             "  f                      Toggle fit mode (Fit Width vs Fit Page)\n"
+             "  d                      Toggle dark mode / color invert\n"
+             "  +, -                   Zoom in / Zoom out\n"
+             "  0                      Reset zoom to 100%\n"
+             "  T                      Table of Contents overlay\n"
+             "  /                      In-document text search\n"
+             "  1 .. 9 / Ctrl+1 .. 9   Switch to tab 1 through 9\n"
+             "  Ctrl+Tab / gt          Next tab\n"
+             "  Ctrl+W                 Close current tab (exits on last tab)\n"
+             "  r                      Force re-render / window resize\n"
+             "  q, Esc                 Quit");
         return 0;
     }
 
-    char *exp = expand_path(argv[1]);
-    struct stat st;
-    if (stat(exp, &st) != 0) {
-        printf("Path not found: %s\n", exp);
-        free(exp);
+    tab_t tabs[MAX_TABS] = {0};
+    int tab_count = 0;
+
+    for (int i = 1; i < argc && tab_count < MAX_TABS; i++) {
+        if (argv[i][0] == '-') continue;
+        pdf_doc_t *doc = pdf_open(argv[i]);
+        if (!doc) {
+            fprintf(stderr, "Warning: failed to open PDF '%s'\n", argv[i]);
+            continue;
+        }
+        tabs[tab_count] = (tab_t){
+            .path = strdup(argv[i]),
+            .name = strdup(get_base_name(argv[i])),
+            .doc = doc,
+            .page = 0,
+            .scroll_y = 0,
+            .zoom = 1.0,
+            .fit = FIT_WIDTH,
+            .dark = false
+        };
+        tab_count++;
+    }
+
+    if (tab_count == 0) {
+        fprintf(stderr, "Error: no valid PDF documents opened.\n");
         return 1;
     }
-    char *pc = strdup(exp);
-    char *dir = S_ISDIR(st.st_mode) ? strdup(exp) : strdup(dirname(pc));
-    free(pc);
-    run_viewer_loop(exp, dir);
-    free(exp); free(dir);
-    profile_shutdown();
-    if (new_argv) free(new_argv);
+
+    struct sigaction sa = { .sa_handler = on_signal };
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    if (!term_enter_raw()) {
+        fprintf(stderr, "Error: failed to initialize raw terminal mode.\n");
+        return 1;
+    }
+    atexit(term_restore);
+
+    int active_tab = 0;
+    render_frame(tabs, tab_count, active_tab, nullptr);
+
+    while (tab_count > 0 && !s_interrupted) {
+        int key = term_read_key(500);
+        if (key == KEY_NONE) continue;
+        if (key == 'q' || key == KEY_ESC) break;
+
+        tab_t *t = &tabs[active_tab];
+        int cols = 0, rows = 0, px_w = 0, px_h = 0;
+        term_get_size(&cols, &rows, &px_w, &px_h);
+        int content_rows = rows - (tab_count > 1 ? 2 : 1);
+        if (content_rows < 1) content_rows = 1;
+        int content_h_px = (int)((double)content_rows * ((double)px_h / rows) + 0.5);
+
+        int step_y = 80;
+        int screen_step = (int)((double)content_h_px * 0.4);
+        if (screen_step < 80) screen_step = 80;
+
+        // Tab switching
+        if (key >= KEY_CTRL_1 && key <= KEY_CTRL_9) {
+            int target = key - KEY_CTRL_1;
+            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, nullptr); }
+        } else if (tab_count > 1 && key >= '1' && key <= '9') {
+            int target = key - '1';
+            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, nullptr); }
+        } else if (key == KEY_CTRL_TAB) {
+            active_tab = (active_tab + 1) % tab_count;
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        } else if (key == KEY_CTRL_W) {
+            // Close current tab
+            pdf_close(tabs[active_tab].doc);
+            free(tabs[active_tab].path);
+            free(tabs[active_tab].name);
+            free(tabs[active_tab].search_hits);
+            for (int i = active_tab; i < tab_count - 1; i++) tabs[i] = tabs[i + 1];
+            tab_count--;
+            if (tab_count == 0) break;
+            if (active_tab >= tab_count) active_tab = tab_count - 1;
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        } else if (key == 'j' || key == KEY_DOWN || key == KEY_WHEEL_DOWN) {
+            int step = (key == KEY_WHEEL_DOWN) ? screen_step : step_y;
+            if (t->fit == FIT_HEIGHT) {
+                if (t->page < t->doc->page_count - 1) { t->page++; t->scroll_y = 0; render_frame(tabs, tab_count, active_tab, nullptr); }
+            } else {
+                if (t->scroll_y + step <= t->max_scroll) {
+                    t->scroll_y += step;
+                    render_frame(tabs, tab_count, active_tab, nullptr);
+                } else if (t->page < t->doc->page_count - 1) {
+                    t->page++;
+                    t->scroll_y = 0;
+                    render_frame(tabs, tab_count, active_tab, nullptr);
+                }
+            }
+        } else if (key == 'k' || key == KEY_UP || key == KEY_WHEEL_UP) {
+            int step = (key == KEY_WHEEL_UP) ? screen_step : step_y;
+            if (t->fit == FIT_HEIGHT) {
+                if (t->page > 0) { t->page--; t->scroll_y = 0; render_frame(tabs, tab_count, active_tab, nullptr); }
+            } else {
+                if (t->scroll_y >= step) {
+                    t->scroll_y -= step;
+                    render_frame(tabs, tab_count, active_tab, nullptr);
+                } else if (t->page > 0) {
+                    t->page--;
+                    t->scroll_y = calc_page_max_scroll(t, t->page, px_w, content_h_px);
+                    render_frame(tabs, tab_count, active_tab, nullptr);
+                }
+            }
+        } else if (key == ' ' || key == KEY_PGDN) {
+            if (t->scroll_y + screen_step <= t->max_scroll) {
+                t->scroll_y += screen_step;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            } else if (t->page < t->doc->page_count - 1) {
+                t->page++;
+                t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            }
+        } else if (key == KEY_PGUP) {
+            if (t->scroll_y >= screen_step) {
+                t->scroll_y -= screen_step;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            } else if (t->page > 0) {
+                t->page--;
+                t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            }
+        } else if (key == 'n') {
+            if (t->search_hit_count > 0) {
+                t->search_hit_idx = (t->search_hit_idx + 1) % t->search_hit_count;
+                t->page = t->search_hits[t->search_hit_idx];
+                t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            } else if (t->page < t->doc->page_count - 1) {
+                t->page++; t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            }
+        } else if (key == 'p' || key == 'N') {
+            if (t->search_hit_count > 0 && key == 'N') {
+                t->search_hit_idx = (t->search_hit_idx + t->search_hit_count - 1) % t->search_hit_count;
+                t->page = t->search_hits[t->search_hit_idx];
+                t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            } else if (t->page > 0) {
+                t->page--; t->scroll_y = 0;
+                render_frame(tabs, tab_count, active_tab, nullptr);
+            }
+        } else if (key == 'f') {
+            t->fit = (t->fit == FIT_WIDTH) ? FIT_HEIGHT : FIT_WIDTH;
+            t->scroll_y = 0;
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        } else if (key == 'd') {
+            t->dark = !t->dark;
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        } else if (key == '+' || key == '=') {
+            if (t->zoom < 5.0) { t->zoom += 0.1; render_frame(tabs, tab_count, active_tab, nullptr); }
+        } else if (key == '-' || key == '_') {
+            if (t->zoom > 0.2) { t->zoom -= 0.1; render_frame(tabs, tab_count, active_tab, nullptr); }
+        } else if (key == '0') {
+            t->zoom = 1.0; t->scroll_y = 0;
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        } else if (key == 'g') {
+            show_page_jump_prompt(tabs, tab_count, active_tab);
+        } else if (key == 'T') {
+            show_toc_modal(tabs, tab_count, active_tab);
+        } else if (key == '/') {
+            show_search_prompt(tabs, tab_count, active_tab);
+        } else if (key == 'r') {
+            render_frame(tabs, tab_count, active_tab, nullptr);
+        }
+    }
+
+    for (int i = 0; i < tab_count; i++) {
+        pdf_close(tabs[i].doc);
+        free(tabs[i].path);
+        free(tabs[i].name);
+        free(tabs[i].search_hits);
+    }
     return 0;
 }
