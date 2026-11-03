@@ -38,6 +38,20 @@ static int get_active_page(const tab_t *t) {
     return t->page_count - 1;
 }
 
+static void next_page(tab_t *t) {
+    if (!t->page_y || t->page_count <= 0) return;
+    for (int i = 0; i < t->page_count; i++)
+        if (t->page_y[i] > t->virtual_y + 10) { t->virtual_y = t->page_y[i]; return; }
+    t->virtual_y = t->max_scroll;
+}
+
+static void prev_page(tab_t *t) {
+    if (!t->page_y || t->page_count <= 0) return;
+    for (int i = t->page_count - 1; i >= 0; i--)
+        if (t->page_y[i] < t->virtual_y - 10) { t->virtual_y = t->page_y[i]; return; }
+    t->virtual_y = 0;
+}
+
 static void render_top_hud(const tab_t *tabs, int tab_count, int active_tab, int cols) {
     printf("\033[1;1H\033[2m\033[K");
     int cur_col = 1;
@@ -120,11 +134,12 @@ static void render_frame(tab_t *tabs, int tab_count, int active_tab, bool show_h
 
     update_tab_layout(t, px_w, content_h_px);
     term_sync_begin();
+    printf("\033]11;%s\007", t->dark ? "#000000" : "#181818");
 
     fz_context *ctx = t->doc->ctx;
     fz_pixmap *vpix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_make_irect(0, 0, px_w, content_h_px), nullptr, 0);
     if (vpix) {
-        fz_clear_pixmap_with_value(ctx, vpix, 0x18);
+        fz_clear_pixmap_with_value(ctx, vpix, t->dark ? 0xFF : 0x18);
         float pw = t->def_pw > 0 ? t->def_pw : 612.0f;
         float ph = t->def_ph > 0 ? t->def_ph : 792.0f;
         double scale = ((t->fit == FIT_WIDTH) ? ((double)px_w / pw) : ((double)content_h_px / ph)) * t->zoom;
@@ -279,7 +294,8 @@ int main(int argc, char **argv) {
              "  d, Space, PgDn         Scroll down screen step (~35%)\n"
              "  u, PgUp                Scroll up screen step (~35%)\n"
              "  Home, < / End, >, G    Jump to start / Jump to end of document\n"
-             "  n, p, N                Next / Previous page (or search match)\n"
+             "  n, Right, J            Jump to next page\n"
+             "  p, Left, K, N          Jump to previous page\n"
              "  i                      Toggle top Tab bar HUD\n"
              "  g                      Jump to page number\n"
              "  f                      Toggle fit mode (Fit Width vs Fit Page)\n"
@@ -384,23 +400,21 @@ int main(int argc, char **argv) {
             t->virtual_y = 0;
         } else if (key == KEY_END || key == 'G' || key == '>') {
             t->virtual_y = t->max_scroll;
-        } else if (key == 'n') {
-            if (t->search_hit_count > 0) {
+        } else if (key == KEY_RIGHT || key == 'n' || key == 'J') {
+            if (key == 'n' && t->search_hit_count > 0) {
                 t->search_hit_idx = (t->search_hit_idx + 1) % t->search_hit_count;
                 int p = t->search_hits[t->search_hit_idx];
                 if (p >= 0 && p < t->page_count && t->page_y) t->virtual_y = t->page_y[p];
             } else {
-                int cp = get_active_page(t);
-                if (cp < t->page_count - 1 && t->page_y) t->virtual_y = t->page_y[cp + 1];
+                next_page(t);
             }
-        } else if (key == 'p' || key == 'N') {
-            if (t->search_hit_count > 0 && key == 'N') {
+        } else if (key == KEY_LEFT || key == 'p' || key == 'N' || key == 'K') {
+            if (key == 'N' && t->search_hit_count > 0) {
                 t->search_hit_idx = (t->search_hit_idx + t->search_hit_count - 1) % t->search_hit_count;
                 int p = t->search_hits[t->search_hit_idx];
                 if (p >= 0 && p < t->page_count && t->page_y) t->virtual_y = t->page_y[p];
             } else {
-                int cp = get_active_page(t);
-                if (cp > 0 && t->page_y) t->virtual_y = t->page_y[cp - 1];
+                prev_page(t);
             }
         } else if (key == 'f') {
             t->fit = (t->fit == FIT_WIDTH) ? FIT_HEIGHT : FIT_WIDTH;

@@ -14,7 +14,7 @@ static void on_sigwinch(int sig) { (void)sig; s_resized = 1; }
 
 static void on_term_signal(int sig) {
     if (s_raw_active) {
-        const char cleanup[] = "\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
+        const char cleanup[] = "\033]111\007\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
         (void)write(STDOUT_FILENO, cleanup, sizeof(cleanup) - 1);
         (void)tcsetattr(STDIN_FILENO, TCSANOW, &s_orig_termios);
         s_raw_active = false;
@@ -37,7 +37,7 @@ bool term_enter_raw(void) {
     raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) return false;
 
-    const char init_seq[] = "\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h";
+    const char init_seq[] = "\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h\033]11;#181818\007";
     (void)write(STDOUT_FILENO, init_seq, sizeof(init_seq) - 1);
 
     struct sigaction sa = { .sa_handler = on_term_signal };
@@ -55,7 +55,7 @@ bool term_enter_raw(void) {
 
 void term_restore(void) {
     if (!s_raw_active) return;
-    const char cleanup[] = "\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
+    const char cleanup[] = "\033]111\007\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
     (void)write(STDOUT_FILENO, cleanup, sizeof(cleanup) - 1);
     (void)tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
     s_raw_active = false;

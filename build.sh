@@ -47,14 +47,12 @@ do_test() {
 }
 
 do_clean() {
-    echo "===> Cleaning build artifacts..."
     rm -rf "$BUILD_DIR" "$BINARY"
     echo "===> Clean complete."
 }
 
 do_install() {
     do_build
-    echo "===> Installing to $PREFIX..."
     mkdir -p "$PREFIX"
     install -Dm755 "$BINARY" "$PREFIX/$BINARY"
     echo "===> Clean install complete: $PREFIX/$BINARY"

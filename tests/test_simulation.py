@@ -181,9 +181,25 @@ def run_simulation():
         check_alive()
         assert b"sim_test.pdf" in re_hud, "HUD did not re-appear on second 'i'"
 
-        # Step 5: Mode toggles: Dark mode 'd', Fit mode 'f', Zoom '+', '-'
-        print("  [SIM 5] Testing feature toggles (dark mode, fit mode, zoom, goto)...")
-        os.write(master, b"d") # Toggle dark mode
+        # Step 5: Next/Previous page & mode toggles
+        print("  [SIM 5] Testing next/prev page navigation and feature toggles...")
+        os.write(master, b"\033[C") # Right arrow: Next page
+        time.sleep(0.05)
+        check_alive()
+
+        os.write(master, b"\033[D") # Left arrow: Prev page
+        time.sleep(0.05)
+        check_alive()
+
+        os.write(master, b"n") # 'n': Next page
+        time.sleep(0.05)
+        check_alive()
+
+        os.write(master, b"p") # 'p': Prev page
+        time.sleep(0.05)
+        check_alive()
+
+        os.write(master, b"D") # 'D': Toggle dark mode
         time.sleep(0.05)
         check_alive()
 
@@ -212,16 +228,17 @@ def run_simulation():
         check_alive()
 
         drain_output(0.3)
-        print("          PASSED (All modal and mode toggles functional)")
+        print("          PASSED (Next/prev page and all modal/mode toggles functional)")
 
         # Step 6: Controlled termination with 'q'
-        print("  [SIM 6] Verifying clean shutdown on 'q' and alternate screen exit...")
+        print("  [SIM 6] Verifying clean shutdown on 'q', OSC 111 color reset, and alt screen exit...")
         os.write(master, b"q")
         exit_out = drain_output(1.0)
         proc.wait(timeout=2.0)
         assert proc.returncode == 0, f"Expected clean exit 0, got {proc.returncode}"
         assert b"\033[?1049l" in exit_out, "Alternate screen buffer exit sequence (\\033[?1049l) not emitted on shutdown!"
-        print("          PASSED (Clean exit with code 0 and alternate screen restored)")
+        assert b"\033]111\007" in exit_out, "Terminal background reset sequence (\\033]111\\007) not emitted on shutdown!"
+        print("          PASSED (Clean exit with code 0, background restored, alt screen exited)")
 
     finally:
         os.close(master)
