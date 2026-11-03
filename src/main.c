@@ -25,9 +25,6 @@ typedef struct {
     size_t search_hit_count, search_hit_idx;
 } tab_t;
 
-static volatile sig_atomic_t s_interrupted = 0;
-static void on_signal(int sig) { (void)sig; s_interrupted = 1; }
-
 static const char *get_base_name(const char *path) {
     const char *s = strrchr(path, '/');
     return s ? s + 1 : path;
@@ -186,7 +183,7 @@ static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab, bool show
         if (toc[i].page >= cur_p) { sel = (int)i; break; }
     }
 
-    while (!s_interrupted) {
+    while (true) {
         if (sel < offset) offset = sel;
         if (sel >= offset + max_v) offset = sel - max_v + 1;
 
@@ -226,7 +223,7 @@ static bool prompt_input(const char *prompt, char *buf, size_t maxlen) {
     int rows = 0; term_get_size(nullptr, &rows, nullptr, nullptr);
     size_t len = 0; buf[0] = '\0';
     fputs("\033[?25h", stdout);
-    while (!s_interrupted) {
+    while (true) {
         printf("\033[%d;1H\033[7m %s%s \033[0m\033[K", rows, prompt, buf);
         fflush(stdout);
         int ch = term_read_key(500, nullptr, nullptr);
@@ -316,11 +313,6 @@ int main(int argc, char **argv) {
     }
     if (tab_count == 0) { fprintf(stderr, "Error: no valid PDF documents opened.\n"); return 1; }
 
-    struct sigaction sa = { .sa_handler = on_signal };
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-
     if (!term_enter_raw()) { fprintf(stderr, "Error: raw terminal failed.\n"); return 1; }
     atexit(term_restore);
 
@@ -328,7 +320,7 @@ int main(int argc, char **argv) {
     bool show_hud = false;
     render_frame(tabs, tab_count, active_tab, show_hud);
 
-    while (tab_count > 0 && !s_interrupted) {
+    while (tab_count > 0) {
         int mouse_col = 0, mouse_row = 0;
         int key = term_read_key(500, &mouse_col, &mouse_row);
         if (key == KEY_NONE) continue;

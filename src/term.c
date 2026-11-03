@@ -12,6 +12,19 @@ static volatile sig_atomic_t s_resized = 0;
 
 static void on_sigwinch(int sig) { (void)sig; s_resized = 1; }
 
+static void on_term_signal(int sig) {
+    if (s_raw_active) {
+        const char cleanup[] = "\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
+        (void)write(STDOUT_FILENO, cleanup, sizeof(cleanup) - 1);
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &s_orig_termios);
+        s_raw_active = false;
+    }
+    struct sigaction sa = { .sa_handler = SIG_DFL };
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
 bool term_enter_raw(void) {
     if (s_raw_active) return true;
     if (tcgetattr(STDIN_FILENO, &s_orig_termios) < 0) return false;
@@ -24,21 +37,27 @@ bool term_enter_raw(void) {
     raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) return false;
 
-    fputs("\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h", stdout);
-    fflush(stdout);
+    const char init_seq[] = "\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h";
+    (void)write(STDOUT_FILENO, init_seq, sizeof(init_seq) - 1);
 
-    struct sigaction sa = { .sa_handler = on_sigwinch, .sa_flags = SA_RESTART };
+    struct sigaction sa = { .sa_handler = on_term_signal };
     sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+    sa.sa_handler = on_sigwinch;
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGWINCH, &sa, nullptr);
+
     s_raw_active = true;
     return true;
 }
 
 void term_restore(void) {
     if (!s_raw_active) return;
-    fputs("\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l", stdout);
-    fflush(stdout);
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
+    const char cleanup[] = "\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l";
+    (void)write(STDOUT_FILENO, cleanup, sizeof(cleanup) - 1);
+    (void)tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
     s_raw_active = false;
 }
 
