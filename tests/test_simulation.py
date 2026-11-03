@@ -215,11 +215,13 @@ def run_simulation():
         print("          PASSED (All modal and mode toggles functional)")
 
         # Step 6: Controlled termination with 'q'
-        print("  [SIM 6] Verifying clean shutdown on 'q'...")
+        print("  [SIM 6] Verifying clean shutdown on 'q' and alternate screen exit...")
         os.write(master, b"q")
+        exit_out = drain_output(1.0)
         proc.wait(timeout=2.0)
         assert proc.returncode == 0, f"Expected clean exit 0, got {proc.returncode}"
-        print("          PASSED (Clean exit with code 0)")
+        assert b"\033[?1049l" in exit_out, "Alternate screen buffer exit sequence (\\033[?1049l) not emitted on shutdown!"
+        print("          PASSED (Clean exit with code 0 and alternate screen restored)")
 
     finally:
         os.close(master)

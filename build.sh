@@ -12,13 +12,7 @@ LIBS="depends/libsixel/libsixel.a depends/go-fitz/libs/libmupdf_linux_amd64.a de
 BINARY="${BINARY:-pdf-cli}"
 PREFIX="${PREFIX:-$HOME/.local/bin}"
 BUILD_DIR="${BUILD_DIR:-build}"
-
-SRCS=(
-    src/pdf.c
-    src/term.c
-    src/sixel.c
-    src/main.c
-)
+SRCS=(src/pdf.c src/term.c src/sixel.c src/main.c)
 
 do_build() {
     echo "===> Compiling pdf-cli (C23 ISO/IEC 9899:2024, max strictness)..."
@@ -39,21 +33,15 @@ do_build() {
 
 do_test() {
     do_build
-    echo ""
-    echo "===> Running smoke test..."
+    echo -e "\n===> Running smoke test..."
     ./"$BINARY" --help > /dev/null
-    echo "===> Smoke test passed!"
-    echo ""
-    echo "===> Building and running test suite..."
+    echo -e "===> Smoke test passed!\n\n===> Building and running test suite..."
     $CC $CFLAGS $EXTRA_CPPFLAGS $INCLUDES tests/test_pdfcli.c "$BUILD_DIR/src_pdf.c.o" "$BUILD_DIR/src_sixel.c.o" "$BUILD_DIR/src_term.c.o" $LIBS $EXTRA_LDFLAGS -o "$BUILD_DIR/test_pdfcli"
     "$BUILD_DIR/test_pdfcli"
-    echo ""
-    echo "===> Testing AddressSanitizer (Memory & Bounds Check)..."
+    echo -e "\n===> Testing AddressSanitizer (Memory & Bounds Check)..."
     $CC -std=c23 -fsanitize=address,undefined -g $INCLUDES tests/test_pdfcli.c src/pdf.c src/sixel.c src/term.c $LIBS -o "$BUILD_DIR/test_asan"
     "$BUILD_DIR/test_asan"
-    echo "===> ASan & UBSan checks passed cleanly (0 leaks, 0 errors)!"
-    echo ""
-    echo "===> Running Interactive PTY Terminal Simulation..."
+    echo -e "===> ASan & UBSan checks passed cleanly (0 leaks, 0 errors)!\n\n===> Running Interactive PTY Terminal Simulation..."
     python3 tests/test_simulation.py
     echo "===> Simulation suite passed cleanly!"
 }
@@ -73,20 +61,9 @@ do_install() {
 }
 
 case "${1:-build}" in
-    build)
-        do_build
-        ;;
-    test)
-        do_test
-        ;;
-    clean)
-        do_clean
-        ;;
-    install)
-        do_install
-        ;;
-    *)
-        echo "Usage: $0 {build|test|clean|install}"
-        exit 1
-        ;;
+    build) do_build ;;
+    test) do_test ;;
+    clean) do_clean ;;
+    install) do_install ;;
+    *) echo "Usage: $0 {build|test|clean|install}"; exit 1 ;;
 esac

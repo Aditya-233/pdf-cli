@@ -22,6 +22,7 @@ enum {
     KEY_END,
     KEY_WHEEL_UP,
     KEY_WHEEL_DOWN,
+    KEY_MOUSE_LEFT,
     KEY_CTRL_TAB,
     KEY_CTRL_1 = 1101,
     KEY_CTRL_2,
@@ -53,16 +54,19 @@ typedef struct {
 [[nodiscard]] pdf_doc_t *pdf_open(const char *path);
 void pdf_close(pdf_doc_t *doc);
 [[nodiscard]] fz_rect pdf_page_bounds(pdf_doc_t *doc, int page);
+bool pdf_render_page_slice(pdf_doc_t *doc, int page, double scale, int sx, int sy, int vw, int vh, fz_pixmap *dst, int dst_x, int dst_y);
 [[nodiscard]] fz_pixmap *pdf_render_viewport(pdf_doc_t *doc, int page, double scale, int scroll_y, int vw, int vh, bool dark);
 [[nodiscard]] toc_item_t *pdf_get_toc(pdf_doc_t *doc, size_t *out_count);
 void pdf_free_toc(toc_item_t *items, size_t count);
 [[nodiscard]] int *pdf_search_text(pdf_doc_t *doc, const char *needle, size_t *out_count);
 
-// Terminal I/O & Key Parsing (termios & foot SGR)
+// Terminal I/O & Key Parsing (termios, foot SGR & sync)
 bool term_enter_raw(void);
 void term_restore(void);
+void term_sync_begin(void);
+void term_sync_end(void);
 void term_get_size(int *cols, int *rows, int *px_w, int *px_h);
-int  term_read_key(int timeout_ms);
+int  term_read_key(int timeout_ms, int *mouse_col, int *mouse_row);
 
 // Sixel Graphics (Foot Terminal)
 bool sixel_draw(const fz_pixmap *pix, int col, int row);

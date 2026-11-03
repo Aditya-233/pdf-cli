@@ -1,9 +1,7 @@
 #include "pdfcli.h"
 #include <string.h>
 
-static void dummy_warning_cb(void *user, const char *msg) {
-    (void)user; (void)msg;
-}
+static void dummy_warning_cb(void *user, const char *msg) { (void)user; (void)msg; }
 
 [[nodiscard]] pdf_doc_t *pdf_open(const char *path) {
     if (!path) return nullptr;
@@ -20,8 +18,7 @@ static void dummy_warning_cb(void *user, const char *msg) {
 
     pdf_doc_t *p = (pdf_doc_t *)calloc(1, sizeof(pdf_doc_t));
     if (!p) { fz_drop_document(ctx, doc); fz_drop_context(ctx); return nullptr; }
-    p->ctx = ctx;
-    p->doc = doc;
+    p->ctx = ctx; p->doc = doc;
     fz_var(p);
     fz_try(ctx) { p->page_count = fz_count_pages(ctx, doc); } fz_catch(ctx) { p->page_count = 0; }
     return p;
@@ -46,42 +43,45 @@ void pdf_close(pdf_doc_t *p) {
     return b;
 }
 
-[[nodiscard]] fz_pixmap *pdf_render_viewport(pdf_doc_t *p, int page, double scale, int scroll_y, int vw, int vh, bool dark) {
-    if (!p || page < 0 || page >= p->page_count || vw <= 0 || vh <= 0) return nullptr;
-    fz_pixmap *pix = nullptr;
-    fz_page *pg = nullptr;
-    fz_device *dev = nullptr;
-    fz_var(pix);
-    fz_var(pg);
-    fz_var(dev);
+bool pdf_render_page_slice(pdf_doc_t *p, int page, double scale, int sx, int sy, int vw, int vh, fz_pixmap *dst, int dst_x, int dst_y) {
+    if (!p || page < 0 || page >= p->page_count || !dst || !dst->samples || vw <= 0 || vh <= 0) return false;
+    if (dst_x < 0 || dst_y < 0 || dst_x + vw > dst->w || dst_y + vh > dst->h) return false;
+    bool ok = false;
+    fz_page *pg = nullptr; fz_device *dev = nullptr; fz_pixmap *sub = nullptr;
+    fz_var(pg); fz_var(dev); fz_var(sub); fz_var(ok);
 
     fz_try(p->ctx) {
         pg = fz_load_page(p->ctx, p->doc, page);
         if (pg) {
-            fz_matrix ctm = fz_concat(fz_scale((float)scale, (float)scale), fz_translate(0.0f, (float)-scroll_y));
-            fz_irect bbox = fz_make_irect(0, 0, vw, vh);
-            pix = fz_new_pixmap_with_bbox(p->ctx, fz_device_rgb(p->ctx), bbox, nullptr, 0);
-            fz_clear_pixmap_with_value(p->ctx, pix, 0xFF);
-            dev = fz_new_draw_device(p->ctx, ctm, pix);
+            fz_matrix ctm = fz_concat(fz_scale((float)scale, (float)scale), fz_translate((float)-sx, (float)-sy));
+            unsigned char *region = dst->samples + (ptrdiff_t)dst_y * dst->stride + (ptrdiff_t)dst_x * dst->n;
+            sub = fz_new_pixmap_with_data(p->ctx, dst->colorspace, vw, vh, nullptr, dst->alpha, (int)dst->stride, region);
+            fz_clear_pixmap_with_value(p->ctx, sub, 0xFF);
+            dev = fz_new_draw_device(p->ctx, ctm, sub);
             fz_run_page(p->ctx, pg, dev, fz_identity, nullptr);
             fz_close_device(p->ctx, dev);
+            ok = true;
         }
     } fz_always(p->ctx) {
-        if (dev) fz_drop_device(p->ctx, dev);
-        if (pg) fz_drop_page(p->ctx, pg);
-    } fz_catch(p->ctx) {
-        if (pix) fz_drop_pixmap(p->ctx, pix);
-        pix = nullptr;
-    }
+        if (dev) { fz_drop_device(p->ctx, dev); dev = nullptr; }
+        if (sub) { fz_drop_pixmap(p->ctx, sub); sub = nullptr; }
+        if (pg) { fz_drop_page(p->ctx, pg); pg = nullptr; }
+    } fz_catch(p->ctx) { ok = false; }
+    return ok;
+}
 
-    if (pix && dark) {
+[[nodiscard]] fz_pixmap *pdf_render_viewport(pdf_doc_t *p, int page, double scale, int scroll_y, int vw, int vh, bool dark) {
+    if (!p || page < 0 || page >= p->page_count || vw <= 0 || vh <= 0) return nullptr;
+    fz_pixmap *pix = fz_new_pixmap_with_bbox(p->ctx, fz_device_rgb(p->ctx), fz_make_irect(0, 0, vw, vh), nullptr, 0);
+    if (!pix) return nullptr;
+    fz_clear_pixmap_with_value(p->ctx, pix, 0xFF);
+    pdf_render_page_slice(p, page, scale, 0, scroll_y, vw, vh, pix, 0, 0);
+    if (dark) {
         for (int y = 0; y < pix->h; y++) {
             unsigned char *row = pix->samples + (size_t)y * (size_t)pix->stride;
-            int row_bytes = pix->w * 3;
+            int rb = pix->w * 3;
             #pragma GCC ivdep
-            for (int x = 0; x < row_bytes; x++) {
-                row[x] = 255 - row[x];
-            }
+            for (int x = 0; x < rb; x++) row[x] = 255 - row[x];
         }
     }
     return pix;
@@ -111,15 +111,10 @@ static void walk_outline(fz_context *ctx, fz_document *doc, fz_outline *o, int l
     if (!p) return nullptr;
     toc_item_t *items = nullptr;
     size_t cnt = 0, cap = 0;
-    fz_var(items);
-    fz_var(cnt);
-    fz_var(cap);
+    fz_var(items); fz_var(cnt); fz_var(cap);
     fz_try(p->ctx) {
         fz_outline *out = fz_load_outline(p->ctx, p->doc);
-        if (out) {
-            walk_outline(p->ctx, p->doc, out, 1, &items, &cnt, &cap);
-            fz_drop_outline(p->ctx, out);
-        }
+        if (out) { walk_outline(p->ctx, p->doc, out, 1, &items, &cnt, &cap); fz_drop_outline(p->ctx, out); }
     } fz_catch(p->ctx) {}
     *out_count = cnt;
     return items;
@@ -139,9 +134,7 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
     size_t cnt = 0, cap = 16;
     pages = (int *)malloc(cap * sizeof(int));
     if (!pages) return nullptr;
-    fz_var(pages);
-    fz_var(cnt);
-    fz_var(cap);
+    fz_var(pages); fz_var(cnt); fz_var(cap);
 
     fz_try(p->ctx) {
         for (int pg_idx = 0; pg_idx < p->page_count; pg_idx++) {
@@ -151,10 +144,7 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
             int n = fz_search_page(p->ctx, pg, needle, nullptr, &quad, 1);
             fz_drop_page(p->ctx, pg);
             if (n > 0) {
-                if (cnt >= cap) {
-                    cap *= 2;
-                    pages = (int *)realloc(pages, cap * sizeof(int));
-                }
+                if (cnt >= cap) { cap *= 2; pages = (int *)realloc(pages, cap * sizeof(int)); }
                 pages[cnt++] = pg_idx;
             }
         }

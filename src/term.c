@@ -21,12 +21,11 @@ bool term_enter_raw(void) {
     raw.c_oflag &= ~(OPOST);
     raw.c_cflag |= (CS8);
     raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG);
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
+    raw.c_cc[VMIN] = 0; raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) < 0) return false;
 
-    // Alt screen, hide cursor, enable SGR 1006 mouse tracking
-    (void)write(STDOUT_FILENO, "\033[?1049h\033[?25l\033[?1000h\033[?1006h", 28);
+    fputs("\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h", stdout);
+    fflush(stdout);
 
     struct sigaction sa = { .sa_handler = on_sigwinch, .sa_flags = SA_RESTART };
     sigemptyset(&sa.sa_mask);
@@ -37,10 +36,14 @@ bool term_enter_raw(void) {
 
 void term_restore(void) {
     if (!s_raw_active) return;
-    (void)write(STDOUT_FILENO, "\033[?1006l\033[?1000l\033[?25h\033[?1049l", 28);
+    fputs("\033[?2026l\033[?7h\033[?1006l\033[?1000l\033[?25h\033[?1049l", stdout);
+    fflush(stdout);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &s_orig_termios);
     s_raw_active = false;
 }
+
+void term_sync_begin(void) { fputs("\033[?2026h", stdout); }
+void term_sync_end(void) { fputs("\033[?2026l", stdout); fflush(stdout); }
 
 void term_get_size(int *cols, int *rows, int *px_w, int *px_h) {
     struct winsize ws = {0};
@@ -57,7 +60,7 @@ void term_get_size(int *cols, int *rows, int *px_w, int *px_h) {
     }
 }
 
-int term_read_key(int timeout_ms) {
+int term_read_key(int timeout_ms, int *mouse_col, int *mouse_row) {
     if (s_resized) { s_resized = 0; return 'r'; }
 
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
@@ -86,10 +89,13 @@ int term_read_key(int timeout_ms) {
                 int btn = 0, col = 0, row = 0;
                 char type = 0;
                 if (sscanf(buf + 3, "%d;%d;%d%c", &btn, &col, &row, &type) >= 3) {
+                    if (mouse_col) *mouse_col = col;
+                    if (mouse_row) *mouse_row = row;
                     if (btn == 64) return KEY_WHEEL_UP;
                     if (btn == 65) return KEY_WHEEL_DOWN;
+                    if (btn == 0 && type == 'M') return KEY_MOUSE_LEFT;
                 }
-                return KEY_NONE; // Safe ignore click/release/motion
+                return KEY_NONE;
             }
             if (buf[2] == 'M') { // Legacy Xterm mouse
                 while (n < 6) {
@@ -102,26 +108,32 @@ int term_read_key(int timeout_ms) {
                     unsigned char cb = (unsigned char)buf[3];
                     if (cb == 96) return KEY_WHEEL_UP;
                     if (cb == 97) return KEY_WHEEL_DOWN;
+                    if (cb == 32) return KEY_MOUSE_LEFT;
                 }
                 return KEY_NONE;
             }
-            if (buf[2] == 'A') return KEY_UP;
-            if (buf[2] == 'B') return KEY_DOWN;
-            if (buf[2] == 'C') return KEY_RIGHT;
-            if (buf[2] == 'D') return KEY_LEFT;
-            if (buf[2] == 'H' || (buf[2] == '1' && buf[3] == '~')) return KEY_HOME;
-            if (buf[2] == 'F' || (buf[2] == '4' && buf[3] == '~')) return KEY_END;
-            if (buf[2] == '5' && buf[3] == '~') return KEY_PGUP;
-            if (buf[2] == '6' && buf[3] == '~') return KEY_PGDN;
-
+            switch (buf[2]) {
+                case 'A': return KEY_UP;
+                case 'B': return KEY_DOWN;
+                case 'C': return KEY_RIGHT;
+                case 'D': return KEY_LEFT;
+                case 'H': return KEY_HOME;
+                case 'F': return KEY_END;
+                case '1': return (buf[3] == '~') ? KEY_HOME : KEY_NONE;
+                case '4': return (buf[3] == '~') ? KEY_END : KEY_NONE;
+                case '5': return (buf[3] == '~') ? KEY_PGUP : KEY_NONE;
+                case '6': return (buf[3] == '~') ? KEY_PGDN : KEY_NONE;
+            }
             int p1 = 0, p2 = 0, p3 = 0;
             int matched = sscanf(buf + 2, "%d;%d;%d", &p1, &p2, &p3);
             if (matched == 3 && p1 == 27 && p2 == 5) {
                 if (p3 >= '1' && p3 <= '9') return KEY_CTRL_1 + (p3 - '1');
                 if (p3 == '\t' || p3 == 9) return KEY_CTRL_TAB;
+                if (p3 == 'w' || p3 == 'W') return KEY_CTRL_W;
             } else if (matched >= 2 && p2 == 5) {
                 if (p1 >= '1' && p1 <= '9') return KEY_CTRL_1 + (p1 - '1');
                 if (p1 == 9) return KEY_CTRL_TAB;
+                if (p1 == 'w' || p1 == 'W') return KEY_CTRL_W;
                 if (p1 == 5) return KEY_PGUP;
                 if (p1 == 6) return KEY_PGDN;
             }
