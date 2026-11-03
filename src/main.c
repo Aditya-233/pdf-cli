@@ -10,8 +10,12 @@ typedef struct {
     char *name;
     pdf_doc_t *doc;
     int page;
-    int scroll_y;
-    int max_scroll;
+    int64_t virtual_y;
+    int64_t max_scroll_y;
+    int64_t *page_y_starts;
+    int *page_heights;
+    float *page_pw;
+    float *page_ph;
     double zoom;
     fit_mode_t fit;
     bool dark;
@@ -29,28 +33,44 @@ static const char *get_base_name(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-static void render_status_bar(const tab_t *t, int tab_idx, int tab_total, int rows, const char *extra_msg) {
-    printf("\033[%d;1H\033[7m", rows);
-    if (extra_msg && extra_msg[0]) {
-        printf(" %s\033[0m\033[K", extra_msg);
-    } else {
-        printf(" [%d/%d] %s | Page %d/%d | Zoom %.0f%% | Fit: %s%s",
-               tab_idx + 1, tab_total, t->name, t->page + 1, t->doc->page_count,
-               t->zoom * 100.0, t->fit == FIT_WIDTH ? "Width" : "Page",
-               t->dark ? " | Dark" : "");
-        if (t->search_hit_count > 0) {
-            printf(" | Search [%zu/%zu]: \"%s\"",
-                   t->search_hit_idx + 1, t->search_hit_count, t->search_query);
+static void update_tab_layout(tab_t *t, int px_w, int content_h_px) {
+    if (!t->doc || t->doc->page_count <= 0) return;
+    int n = t->doc->page_count;
+    int64_t cur_y = 0;
+    const int GAP = 12;
+
+    for (int i = 0; i < n; i++) {
+        t->page_y_starts[i] = cur_y;
+        float pw = t->page_pw[i] > 0 ? t->page_pw[i] : 612.0f;
+        float ph = t->page_ph[i] > 0 ? t->page_ph[i] : 792.0f;
+        double scale;
+        if (t->fit == FIT_WIDTH) {
+            scale = ((double)px_w / (double)pw) * t->zoom;
+            int page_h = (int)(ph * scale + 0.5);
+            if (page_h < 1) page_h = 1;
+            t->page_heights[i] = page_h;
+            cur_y += page_h + GAP;
+        } else {
+            scale = ((double)content_h_px / (double)ph) * t->zoom;
+            int page_h = (int)(ph * scale + 0.5);
+            if (page_h < 1) page_h = 1;
+            int slot_h = (page_h < content_h_px) ? content_h_px : (page_h + GAP);
+            t->page_heights[i] = page_h;
+            cur_y += slot_h;
         }
-        printf(" \033[0m\033[K");
     }
-    fflush(stdout);
+    if (t->fit == FIT_WIDTH && cur_y >= GAP) cur_y -= GAP;
+
+    int64_t total_doc_h = cur_y;
+    t->max_scroll_y = (total_doc_h > content_h_px) ? (total_doc_h - content_h_px) : 0;
+    if (t->virtual_y > t->max_scroll_y) t->virtual_y = t->max_scroll_y;
+    if (t->virtual_y < 0) t->virtual_y = 0;
 }
 
-static void render_tab_bar(const tab_t *tabs, int tab_count, int active_tab, int cols) {
-    printf("\033[1;1H\033[2m\033[K"); // Clear row 1
+static void render_top_hud(const tab_t *tabs, int tab_count, int active_tab, int cols) {
+    printf("\033[1;1H\033[2m\033[K");
     int cur_col = 1;
-    for (int i = 0; i < tab_count && cur_col < cols - 8; i++) {
+    for (int i = 0; i < tab_count && cur_col < cols - 32; i++) {
         bool is_act = (i == active_tab);
         char label[64];
         snprintf(label, sizeof(label), " %d: %.16s%s ", i + 1, tabs[i].name, is_act ? "*" : "");
@@ -58,71 +78,97 @@ static void render_tab_bar(const tab_t *tabs, int tab_count, int active_tab, int
         else printf("\033[0;2m%s\033[0m\033[2m", label);
         cur_col += (int)strlen(label);
     }
-    printf("\033[0m");
+    const tab_t *act = &tabs[active_tab];
+    char info[256];
+    snprintf(info, sizeof(info), " | Page %d/%d | %.0f%% | %s%s",
+             act->page + 1, act->doc->page_count, act->zoom * 100.0,
+             act->fit == FIT_WIDTH ? "Width" : "Page",
+             act->dark ? " | Dark" : "");
+    if (act->search_hit_count > 0) {
+        char s_info[128];
+        snprintf(s_info, sizeof(s_info), " | [%zu/%zu] \"%.32s\"", act->search_hit_idx + 1, act->search_hit_count, act->search_query);
+        strncat(info, s_info, sizeof(info) - strlen(info) - 1);
+    }
+    printf("%s\033[0m", info);
     fflush(stdout);
 }
 
-static void render_frame(tab_t *tabs, int tab_count, int active_tab, const char *extra_msg) {
+static void render_frame(tab_t *tabs, int tab_count, int active_tab, bool show_hud) {
     if (tab_count <= 0 || active_tab < 0 || active_tab >= tab_count) return;
     tab_t *t = &tabs[active_tab];
 
     int cols = 0, rows = 0, px_w = 0, px_h = 0;
     term_get_size(&cols, &rows, &px_w, &px_h);
 
-    bool show_tabs = (tab_count > 1);
-    int content_start_row = show_tabs ? 2 : 1;
-    int content_rows = rows - (show_tabs ? 2 : 1);
+    int content_start_row = show_hud ? 2 : 1;
+    int content_rows = rows - (show_hud ? 1 : 0);
     if (content_rows < 1) content_rows = 1;
 
     double cell_h = (double)px_h / (double)rows;
     int content_h_px = (int)((double)content_rows * cell_h + 0.5);
 
-    fz_rect b = pdf_page_bounds(t->doc, t->page);
-    float pw = (b.x1 > b.x0) ? (b.x1 - b.x0) : 612.0f;
-    float ph = (b.y1 > b.y0) ? (b.y1 - b.y0) : 792.0f;
+    update_tab_layout(t, px_w, content_h_px);
 
-    double base_scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) : ((double)content_h_px / (double)ph);
-    double scale = base_scale * t->zoom;
-    int total_page_h = (int)(ph * scale + 0.5);
+    fz_pixmap *comp = fz_new_pixmap_with_bbox(t->doc->ctx, fz_device_rgb(t->doc->ctx), fz_make_irect(0, 0, px_w, content_h_px), nullptr, 0);
+    if (!comp) return;
+    fz_clear_pixmap_with_value(t->doc->ctx, comp, t->dark ? 0x12 : 0x24);
 
-    t->max_scroll = (total_page_h > content_h_px) ? (total_page_h - content_h_px) : 0;
-    if (t->scroll_y > t->max_scroll) t->scroll_y = t->max_scroll;
-    if (t->scroll_y < 0) t->scroll_y = 0;
+    int n = t->doc->page_count;
+    for (int i = 0; i < n; i++) {
+        int64_t page_y0 = t->page_y_starts[i];
+        int page_h = t->page_heights[i];
+        int64_t page_y1 = page_y0 + page_h;
 
-    fz_pixmap *pix = pdf_render_viewport(t->doc, t->page, scale, t->scroll_y, px_w, content_h_px, t->dark);
-    if (pix) {
-        sixel_draw(pix, 1, content_start_row);
-        fz_drop_pixmap(t->doc->ctx, pix);
+        if (page_y1 <= t->virtual_y) continue;
+        if (page_y0 >= t->virtual_y + content_h_px) break;
+
+        int64_t v0 = (t->virtual_y > page_y0) ? t->virtual_y : page_y0;
+        int64_t v1 = (t->virtual_y + content_h_px < page_y1) ? (t->virtual_y + content_h_px) : page_y1;
+        int slice_h = (int)(v1 - v0);
+        if (slice_h <= 0) continue;
+
+        int src_y = (int)(v0 - page_y0);
+        int dst_y = (int)(v0 - t->virtual_y);
+
+        float pw = t->page_pw[i] > 0 ? t->page_pw[i] : 612.0f;
+        float ph = t->page_ph[i] > 0 ? t->page_ph[i] : 792.0f;
+        double scale = (t->fit == FIT_WIDTH) ? (((double)px_w / (double)pw) * t->zoom) : (((double)content_h_px / (double)ph) * t->zoom);
+
+        int page_w = (int)(pw * scale + 0.5);
+        int dst_x = 0, slice_w = px_w, sx = 0;
+        if (page_w <= px_w) {
+            slice_w = page_w;
+            dst_x = (px_w - page_w) / 2;
+        } else {
+            slice_w = px_w;
+            sx = (page_w - px_w) / 2;
+        }
+
+        pdf_render_page_slice(t->doc, i, scale, sx, src_y, slice_w, slice_h, comp, dst_x, dst_y, t->dark);
     }
 
-    if (show_tabs) render_tab_bar(tabs, tab_count, active_tab, cols);
-    render_status_bar(t, active_tab, tab_count, rows, extra_msg);
+    for (int i = 0; i < n; i++) {
+        if (t->page_y_starts[i] <= t->virtual_y + content_h_px / 3) {
+            t->page = i;
+        }
+    }
+
+    if (!show_hud) printf("\033[1;1H\033[K");
+    sixel_draw(comp, 1, content_start_row);
+    fz_drop_pixmap(t->doc->ctx, comp);
+
+    if (show_hud) render_top_hud(tabs, tab_count, active_tab, cols);
 }
 
-static int calc_page_max_scroll(const tab_t *t, int page_idx, int px_w, int content_h_px) {
-    fz_rect b = pdf_page_bounds(t->doc, page_idx);
-    float pw = (b.x1 > b.x0) ? (b.x1 - b.x0) : 612.0f;
-    float ph = (b.y1 > b.y0) ? (b.y1 - b.y0) : 792.0f;
-    double base_scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) : ((double)content_h_px / (double)ph);
-    double scale = base_scale * t->zoom;
-    int page_h = (int)(ph * scale + 0.5);
-    return (page_h > content_h_px) ? (page_h - content_h_px) : 0;
-}
-
-static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab) {
+static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab, bool show_hud) {
     tab_t *t = &tabs[active_tab];
     size_t toc_cnt = 0;
     toc_item_t *toc = pdf_get_toc(t->doc, &toc_cnt);
-    if (!toc || toc_cnt == 0) {
-        render_frame(tabs, tab_count, active_tab, "Document has no Table of Contents");
-        pdf_free_toc(toc, toc_cnt);
-        return;
-    }
+    if (!toc || toc_cnt == 0) { pdf_free_toc(toc, toc_cnt); return; }
 
     int cols = 0, rows = 0;
     term_get_size(&cols, &rows, nullptr, nullptr);
-    int top = 3, bottom = rows - 2;
-    int max_visible = bottom - top + 1;
+    int top = 3, bottom = rows - 2, max_visible = bottom - top + 1;
     if (max_visible < 3) { pdf_free_toc(toc, toc_cnt); return; }
 
     int sel = 0, offset = 0;
@@ -142,12 +188,9 @@ static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab) {
                 bool is_sel = (idx == sel);
                 int indent = (toc[idx].level - 1) * 2;
                 if (indent > 12) indent = 12;
-                if (is_sel) printf("\033[7m > %*s%-*.*s (p. %d)\033[0m\033[K",
-                                   indent, "", cols - indent - 16, cols - indent - 16,
-                                   toc[idx].title, toc[idx].page + 1);
-                else printf("   %*s%-*.*s (p. %d)\033[K",
-                            indent, "", cols - indent - 16, cols - indent - 16,
-                            toc[idx].title, toc[idx].page + 1);
+                printf("%s %*s%-*.*s (p. %d)\033[0m\033[K", is_sel ? "\033[7m >" : "   ",
+                       indent, "", cols - indent - 16, cols - indent - 16,
+                       toc[idx].title, toc[idx].page + 1);
             } else {
                 printf("\033[K");
             }
@@ -166,130 +209,101 @@ static void show_toc_modal(tab_t *tabs, int tab_count, int active_tab) {
         } else if (k == KEY_PGUP) {
             sel = (sel >= max_visible) ? (sel - max_visible) : 0;
         } else if (k == '\r' || k == '\n') {
-            t->page = toc[sel].page;
-            t->scroll_y = 0;
+            int target_p = toc[sel].page;
+            if (target_p >= 0 && target_p < t->doc->page_count) {
+                t->page = target_p;
+                t->virtual_y = t->page_y_starts[target_p];
+            }
             break;
         }
     }
     pdf_free_toc(toc, toc_cnt);
-    render_frame(tabs, tab_count, active_tab, nullptr);
+    render_frame(tabs, tab_count, active_tab, show_hud);
 }
 
-static void show_search_prompt(tab_t *tabs, int tab_count, int active_tab) {
-    tab_t *t = &tabs[active_tab];
-    int cols = 0, rows = 0;
-    term_get_size(&cols, &rows, nullptr, nullptr);
-    (void)cols;
-
-    char query[64] = {0};
-    size_t qlen = 0;
-
-    (void)write(STDOUT_FILENO, "\033[?25h", 6); // Show cursor for prompt
+static bool prompt_input(const char *prompt, char *buf, size_t maxlen) {
+    int rows = 0;
+    term_get_size(nullptr, &rows, nullptr, nullptr);
+    size_t len = 0;
+    buf[0] = '\0';
+    (void)write(STDOUT_FILENO, "\033[?25h", 6);
     while (!s_interrupted) {
-        printf("\033[%d;1H\033[7m /Search: %s\033[0m\033[K", rows, query);
+        printf("\033[%d;1H\033[7m %s%s \033[0m\033[K", rows, prompt, buf);
         fflush(stdout);
         int ch = term_read_key(500);
         if (ch == KEY_NONE) continue;
         if (ch == KEY_ESC || ch == KEY_CTRL_C) {
             (void)write(STDOUT_FILENO, "\033[?25l", 6);
-            render_frame(tabs, tab_count, active_tab, nullptr);
-            return;
+            return false;
         }
         if (ch == '\r' || ch == '\n') break;
         if (ch == 127 || ch == 8) {
-            if (qlen > 0) query[--qlen] = '\0';
-        } else if (isprint(ch) && qlen < sizeof(query) - 1) {
-            query[qlen++] = (char)ch;
-            query[qlen] = '\0';
+            if (len > 0) buf[--len] = '\0';
+        } else if (isprint(ch) && len < maxlen - 1) {
+            buf[len++] = (char)ch;
+            buf[len] = '\0';
         }
     }
     (void)write(STDOUT_FILENO, "\033[?25l", 6);
-
-    if (qlen == 0) {
-        render_frame(tabs, tab_count, active_tab, nullptr);
-        return;
-    }
-
-    snprintf(t->search_query, sizeof(t->search_query), "%s", query);
-    free(t->search_hits);
-    t->search_hits = pdf_search_text(t->doc, query, &t->search_hit_count);
-    t->search_hit_idx = 0;
-
-    if (t->search_hit_count == 0) {
-        render_frame(tabs, tab_count, active_tab, "No occurrences found");
-        return;
-    }
-
-    // Find first hit on or after current page
-    for (size_t i = 0; i < t->search_hit_count; i++) {
-        if (t->search_hits[i] >= t->page) {
-            t->search_hit_idx = i;
-            break;
-        }
-    }
-    t->page = t->search_hits[t->search_hit_idx];
-    t->scroll_y = 0;
-    render_frame(tabs, tab_count, active_tab, nullptr);
+    return len > 0;
 }
 
-static void show_page_jump_prompt(tab_t *tabs, int tab_count, int active_tab) {
+static void show_search_prompt(tab_t *tabs, int tab_count, int active_tab, bool show_hud) {
     tab_t *t = &tabs[active_tab];
-    int cols = 0, rows = 0;
-    term_get_size(&cols, &rows, nullptr, nullptr);
-    (void)cols;
-
-    char num[16] = {0};
-    size_t nlen = 0;
-    (void)write(STDOUT_FILENO, "\033[?25h", 6);
-
-    while (!s_interrupted) {
-        printf("\033[%d;1H\033[7m Go to page (1-%d): %s\033[0m\033[K", rows, t->doc->page_count, num);
-        fflush(stdout);
-        int ch = term_read_key(500);
-        if (ch == KEY_NONE) continue;
-        if (ch == KEY_ESC || ch == KEY_CTRL_C) break;
-        if (ch == '\r' || ch == '\n') {
-            if (nlen > 0) {
-                int p = atoi(num);
-                if (p >= 1 && p <= t->doc->page_count) {
-                    t->page = p - 1;
-                    t->scroll_y = 0;
-                }
+    char query[64] = {0};
+    if (prompt_input("Search:", query, sizeof(query))) {
+        snprintf(t->search_query, sizeof(t->search_query), "%s", query);
+        free(t->search_hits);
+        t->search_hits = pdf_search_text(t->doc, query, &t->search_hit_count);
+        t->search_hit_idx = 0;
+        if (t->search_hit_count > 0) {
+            for (size_t i = 0; i < t->search_hit_count; i++) {
+                if (t->search_hits[i] >= t->page) { t->search_hit_idx = i; break; }
             }
-            break;
-        }
-        if (ch == 127 || ch == 8) {
-            if (nlen > 0) num[--nlen] = '\0';
-        } else if (isdigit(ch) && nlen < sizeof(num) - 1) {
-            num[nlen++] = (char)ch;
-            num[nlen] = '\0';
+            int target_p = t->search_hits[t->search_hit_idx];
+            t->page = target_p;
+            t->virtual_y = t->page_y_starts[target_p];
         }
     }
-    (void)write(STDOUT_FILENO, "\033[?25l", 6);
-    render_frame(tabs, tab_count, active_tab, nullptr);
+    render_frame(tabs, tab_count, active_tab, show_hud);
+}
+
+static void show_page_jump_prompt(tab_t *tabs, int tab_count, int active_tab, bool show_hud) {
+    tab_t *t = &tabs[active_tab];
+    char num[16] = {0}, prompt[32];
+    snprintf(prompt, sizeof(prompt), "Go to page (1-%d):", t->doc->page_count);
+    if (prompt_input(prompt, num, sizeof(num))) {
+        int p = atoi(num);
+        if (p >= 1 && p <= t->doc->page_count) {
+            t->page = p - 1;
+            t->virtual_y = t->page_y_starts[p - 1];
+        }
+    }
+    render_frame(tabs, tab_count, active_tab, show_hud);
 }
 
 int main(int argc, char **argv) {
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
         puts("pdf-cli (C23) - Fast Sixel Terminal PDF Viewer\n\n"
              "Usage: pdf-cli [options] <file1.pdf> [file2.pdf ...]\n\n"
-             "Navigation:\n"
-             "  j, Down, Space, PgDn   Scroll down / Next page\n"
-             "  k, Up, PgUp            Scroll up / Previous page\n"
-             "  WheelUp, WheelDown     Mouse wheel continuous scroll\n"
-             "  n, p                   Next / Previous page (or search match)\n"
+             "Controls:\n"
+             "  j, Down, WheelDown     Scroll down smoothly / across pages\n"
+             "  k, Up, WheelUp         Scroll up smoothly / across pages\n"
+             "  Space, PgDn / PgUp     Page down / Page up\n"
+             "  Home, < / End, >, G    Jump to start / Jump to end\n"
+             "  n, p, N                Next / Previous page (or search match)\n"
+             "  i                      Toggle top Tab bar & document info\n"
              "  g                      Jump to page number\n"
              "  f                      Toggle fit mode (Fit Width vs Fit Page)\n"
              "  d                      Toggle dark mode / color invert\n"
-             "  +, -                   Zoom in / Zoom out\n"
-             "  0                      Reset zoom to 100%\n"
+             "  +, - / 0               Zoom in / Zoom out / Reset zoom\n"
              "  T                      Table of Contents overlay\n"
              "  /                      In-document text search\n"
-             "  1 .. 9 / Ctrl+1 .. 9   Switch to tab 1 through 9\n"
-             "  Ctrl+Tab / gt          Next tab\n"
-             "  Ctrl+W                 Close current tab (exits on last tab)\n"
+             "  1..9 / Ctrl+1..9       Switch tab directly\n"
+             "  Ctrl+Tab               Cycle tabs\n"
+             "  Ctrl+W                 Close tab (exits on last tab)\n"
              "  r                      Force re-render / window resize\n"
-             "  q, Esc                 Quit");
+             "  q                      Quit viewer");
         return 0;
     }
 
@@ -303,17 +317,27 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Warning: failed to open PDF '%s'\n", argv[i]);
             continue;
         }
-        tabs[tab_count] = (tab_t){
-            .path = strdup(argv[i]),
-            .name = strdup(get_base_name(argv[i])),
-            .doc = doc,
-            .page = 0,
-            .scroll_y = 0,
-            .zoom = 1.0,
-            .fit = FIT_WIDTH,
-            .dark = false
-        };
-        tab_count++;
+
+        tab_t *t = &tabs[tab_count++];
+        t->path = strdup(argv[i]);
+        t->name = strdup(get_base_name(argv[i]));
+        t->doc = doc;
+        t->page = 0;
+        t->virtual_y = 0;
+        t->zoom = 1.0;
+        t->fit = FIT_WIDTH;
+        t->dark = false;
+
+        int n = doc->page_count;
+        t->page_pw = (float *)malloc((size_t)n * sizeof(float));
+        t->page_ph = (float *)malloc((size_t)n * sizeof(float));
+        t->page_y_starts = (int64_t *)malloc((size_t)n * sizeof(int64_t));
+        t->page_heights = (int *)malloc((size_t)n * sizeof(int));
+        for (int p = 0; p < n; p++) {
+            fz_rect b = pdf_page_bounds(doc, p);
+            t->page_pw[p] = (b.x1 > b.x0) ? (b.x1 - b.x0) : 612.0f;
+            t->page_ph[p] = (b.y1 > b.y0) ? (b.y1 - b.y0) : 792.0f;
+        }
     }
 
     if (tab_count == 0) {
@@ -333,133 +357,137 @@ int main(int argc, char **argv) {
     atexit(term_restore);
 
     int active_tab = 0;
-    render_frame(tabs, tab_count, active_tab, nullptr);
+    bool show_hud = false;
+    render_frame(tabs, tab_count, active_tab, show_hud);
 
     while (tab_count > 0 && !s_interrupted) {
         int key = term_read_key(500);
         if (key == KEY_NONE) continue;
-        if (key == 'q' || key == KEY_ESC) break;
+        if (key == 'q' || key == KEY_CTRL_C) break;
 
         tab_t *t = &tabs[active_tab];
         int cols = 0, rows = 0, px_w = 0, px_h = 0;
         term_get_size(&cols, &rows, &px_w, &px_h);
-        int content_rows = rows - (tab_count > 1 ? 2 : 1);
+        int content_rows = rows - (show_hud ? 1 : 0);
         if (content_rows < 1) content_rows = 1;
         int content_h_px = (int)((double)content_rows * ((double)px_h / rows) + 0.5);
 
-        int step_y = 80;
-        int screen_step = (int)((double)content_h_px * 0.4);
-        if (screen_step < 80) screen_step = 80;
+        int step_y = 60;
+        int screen_step = (int)((double)content_h_px * 0.75);
+        if (screen_step < 60) screen_step = 60;
 
-        // Tab switching
+        if (key == KEY_ESC) {
+            if (show_hud) {
+                show_hud = false;
+                render_frame(tabs, tab_count, active_tab, show_hud);
+            }
+            continue;
+        }
+
+        if (key == 'i') {
+            show_hud = !show_hud;
+            render_frame(tabs, tab_count, active_tab, show_hud);
+            continue;
+        }
+
         if (key >= KEY_CTRL_1 && key <= KEY_CTRL_9) {
             int target = key - KEY_CTRL_1;
-            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, nullptr); }
+            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, show_hud); }
         } else if (tab_count > 1 && key >= '1' && key <= '9') {
             int target = key - '1';
-            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, nullptr); }
+            if (target < tab_count) { active_tab = target; render_frame(tabs, tab_count, active_tab, show_hud); }
         } else if (key == KEY_CTRL_TAB) {
             active_tab = (active_tab + 1) % tab_count;
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == KEY_CTRL_W) {
-            // Close current tab
             pdf_close(tabs[active_tab].doc);
             free(tabs[active_tab].path);
             free(tabs[active_tab].name);
+            free(tabs[active_tab].page_pw);
+            free(tabs[active_tab].page_ph);
+            free(tabs[active_tab].page_y_starts);
+            free(tabs[active_tab].page_heights);
             free(tabs[active_tab].search_hits);
             for (int i = active_tab; i < tab_count - 1; i++) tabs[i] = tabs[i + 1];
             tab_count--;
             if (tab_count == 0) break;
             if (active_tab >= tab_count) active_tab = tab_count - 1;
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'j' || key == KEY_DOWN || key == KEY_WHEEL_DOWN) {
-            int step = (key == KEY_WHEEL_DOWN) ? screen_step : step_y;
-            if (t->fit == FIT_HEIGHT) {
-                if (t->page < t->doc->page_count - 1) { t->page++; t->scroll_y = 0; render_frame(tabs, tab_count, active_tab, nullptr); }
-            } else {
-                if (t->scroll_y + step <= t->max_scroll) {
-                    t->scroll_y += step;
-                    render_frame(tabs, tab_count, active_tab, nullptr);
-                } else if (t->page < t->doc->page_count - 1) {
-                    t->page++;
-                    t->scroll_y = 0;
-                    render_frame(tabs, tab_count, active_tab, nullptr);
-                }
-            }
+            t->virtual_y = (t->virtual_y + step_y <= t->max_scroll_y) ? (t->virtual_y + step_y) : t->max_scroll_y;
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'k' || key == KEY_UP || key == KEY_WHEEL_UP) {
-            int step = (key == KEY_WHEEL_UP) ? screen_step : step_y;
-            if (t->fit == FIT_HEIGHT) {
-                if (t->page > 0) { t->page--; t->scroll_y = 0; render_frame(tabs, tab_count, active_tab, nullptr); }
-            } else {
-                if (t->scroll_y >= step) {
-                    t->scroll_y -= step;
-                    render_frame(tabs, tab_count, active_tab, nullptr);
-                } else if (t->page > 0) {
-                    t->page--;
-                    t->scroll_y = calc_page_max_scroll(t, t->page, px_w, content_h_px);
-                    render_frame(tabs, tab_count, active_tab, nullptr);
-                }
-            }
+            t->virtual_y = (t->virtual_y >= step_y) ? (t->virtual_y - step_y) : 0;
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == ' ' || key == KEY_PGDN) {
-            if (t->scroll_y + screen_step <= t->max_scroll) {
-                t->scroll_y += screen_step;
-                render_frame(tabs, tab_count, active_tab, nullptr);
-            } else if (t->page < t->doc->page_count - 1) {
-                t->page++;
-                t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
-            }
+            t->virtual_y = (t->virtual_y + screen_step <= t->max_scroll_y) ? (t->virtual_y + screen_step) : t->max_scroll_y;
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == KEY_PGUP) {
-            if (t->scroll_y >= screen_step) {
-                t->scroll_y -= screen_step;
-                render_frame(tabs, tab_count, active_tab, nullptr);
-            } else if (t->page > 0) {
-                t->page--;
-                t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
-            }
+            t->virtual_y = (t->virtual_y >= screen_step) ? (t->virtual_y - screen_step) : 0;
+            render_frame(tabs, tab_count, active_tab, show_hud);
+        } else if (key == KEY_HOME || key == '<') {
+            t->virtual_y = 0;
+            render_frame(tabs, tab_count, active_tab, show_hud);
+        } else if (key == KEY_END || key == 'G' || key == '>') {
+            t->virtual_y = t->max_scroll_y;
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'n') {
             if (t->search_hit_count > 0) {
                 t->search_hit_idx = (t->search_hit_idx + 1) % t->search_hit_count;
-                t->page = t->search_hits[t->search_hit_idx];
-                t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
+                int target_p = t->search_hits[t->search_hit_idx];
+                t->page = target_p;
+                t->virtual_y = t->page_y_starts[target_p];
+                render_frame(tabs, tab_count, active_tab, show_hud);
             } else if (t->page < t->doc->page_count - 1) {
-                t->page++; t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
+                t->page++;
+                t->virtual_y = t->page_y_starts[t->page];
+                render_frame(tabs, tab_count, active_tab, show_hud);
             }
         } else if (key == 'p' || key == 'N') {
             if (t->search_hit_count > 0 && key == 'N') {
                 t->search_hit_idx = (t->search_hit_idx + t->search_hit_count - 1) % t->search_hit_count;
-                t->page = t->search_hits[t->search_hit_idx];
-                t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
+                int target_p = t->search_hits[t->search_hit_idx];
+                t->page = target_p;
+                t->virtual_y = t->page_y_starts[target_p];
+                render_frame(tabs, tab_count, active_tab, show_hud);
             } else if (t->page > 0) {
-                t->page--; t->scroll_y = 0;
-                render_frame(tabs, tab_count, active_tab, nullptr);
+                t->page--;
+                t->virtual_y = t->page_y_starts[t->page];
+                render_frame(tabs, tab_count, active_tab, show_hud);
             }
         } else if (key == 'f') {
             t->fit = (t->fit == FIT_WIDTH) ? FIT_HEIGHT : FIT_WIDTH;
-            t->scroll_y = 0;
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            update_tab_layout(t, px_w, content_h_px);
+            t->virtual_y = t->page_y_starts[t->page];
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'd') {
             t->dark = !t->dark;
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == '+' || key == '=') {
-            if (t->zoom < 5.0) { t->zoom += 0.1; render_frame(tabs, tab_count, active_tab, nullptr); }
+            if (t->zoom < 5.0) {
+                t->zoom += 0.1;
+                update_tab_layout(t, px_w, content_h_px);
+                render_frame(tabs, tab_count, active_tab, show_hud);
+            }
         } else if (key == '-' || key == '_') {
-            if (t->zoom > 0.2) { t->zoom -= 0.1; render_frame(tabs, tab_count, active_tab, nullptr); }
+            if (t->zoom > 0.2) {
+                t->zoom -= 0.1;
+                update_tab_layout(t, px_w, content_h_px);
+                render_frame(tabs, tab_count, active_tab, show_hud);
+            }
         } else if (key == '0') {
-            t->zoom = 1.0; t->scroll_y = 0;
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            t->zoom = 1.0;
+            update_tab_layout(t, px_w, content_h_px);
+            t->virtual_y = t->page_y_starts[t->page];
+            render_frame(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'g') {
-            show_page_jump_prompt(tabs, tab_count, active_tab);
+            show_page_jump_prompt(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'T') {
-            show_toc_modal(tabs, tab_count, active_tab);
+            show_toc_modal(tabs, tab_count, active_tab, show_hud);
         } else if (key == '/') {
-            show_search_prompt(tabs, tab_count, active_tab);
+            show_search_prompt(tabs, tab_count, active_tab, show_hud);
         } else if (key == 'r') {
-            render_frame(tabs, tab_count, active_tab, nullptr);
+            render_frame(tabs, tab_count, active_tab, show_hud);
         }
     }
 
@@ -467,6 +495,10 @@ int main(int argc, char **argv) {
         pdf_close(tabs[i].doc);
         free(tabs[i].path);
         free(tabs[i].name);
+        free(tabs[i].page_pw);
+        free(tabs[i].page_ph);
+        free(tabs[i].page_y_starts);
+        free(tabs[i].page_heights);
         free(tabs[i].search_hits);
     }
     return 0;

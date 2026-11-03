@@ -52,6 +52,10 @@ do_test() {
     $CC -std=c23 -fsanitize=address,undefined -g $INCLUDES tests/test_pdfcli.c src/pdf.c src/sixel.c src/term.c $LIBS -o "$BUILD_DIR/test_asan"
     "$BUILD_DIR/test_asan"
     echo "===> ASan & UBSan checks passed cleanly (0 leaks, 0 errors)!"
+    echo ""
+    echo "===> Running Interactive PTY Terminal Simulation..."
+    python3 tests/test_simulation.py
+    echo "===> Simulation suite passed cleanly!"
 }
 
 do_clean() {
