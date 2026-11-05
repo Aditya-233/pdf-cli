@@ -9,3 +9,7 @@ depends/termbox2/
 trace.json
 *.trace
 .agents/
+__pycache__/
+*.pyc
+compile_commands.json
+

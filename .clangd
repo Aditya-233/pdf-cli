@@ -1,0 +1,22 @@
+CompileFlags:
+  Add:
+    - -std=c23
+    - -Wall
+    - -Wextra
+    - -Wpedantic
+    - -Wshadow
+    - -Wconversion
+    - -Wsign-conversion
+
+Diagnostics:
+  ClangTidy:
+    Add:
+      - bugprone-*
+      - cert-*
+      - clang-analyzer-*
+      - misc-*
+      - performance-*
+      - readability-*
+    Remove:
+      - readability-identifier-length
+      - readability-function-cognitive-complexity
