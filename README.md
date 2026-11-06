@@ -74,9 +74,8 @@ A lightweight, ultra-fast terminal PDF viewer written in modern **C23 (ISO/IEC 9
 
 ### Requirements
 - **C23 Compliant Compiler**: GCC 13+ or Clang 18+
-- **Python 3**: For running pseudoterminal (PTY) simulation test suites
 - **Host Terminal**: Foot, xterm, or any terminal supporting Sixel graphics
-- Static libraries for MuPDF and libsixel (bundled in `depends/`)
+- Bundled C dependencies in `depends/` (MuPDF, libsixel)
 
 ### Building from Source
 
@@ -120,8 +119,6 @@ file="$(fzf)" && [ -n "$file" ] && pdf-cli "$file"
 
 ## Licensing & Dependencies
 
-- **pdf-cli**: Licensed under the [MIT License](LICENSE).
-- **MuPDF**: Bundled in `depends/go-fitz/libs/` under the [GNU AGPLv3](depends/go-fitz/COPYING) (or commercial terms from Artifex Software, Inc.).
-- **libsixel**: Bundled in `depends/libsixel/` under the [MIT License](depends/libsixel/LICENSE).
-
-See [DEPENDENCIES.md](DEPENDENCIES.md) for full Software Bill of Materials (SBOM), provenance, and corresponding source build instructions.
+- **pdf-cli**: Original work under the MIT License.
+- **MuPDF**: Bundled in `depends/go-fitz/` under GNU AGPLv3 (Artifex Software, Inc.).
+- **libsixel**: Bundled in `depends/libsixel/` under the MIT License.

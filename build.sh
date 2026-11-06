@@ -135,7 +135,7 @@ do_lint() {
     echo "===================================================="
     echo "===> Running GCC at Maximum Strictness & -fanalyzer"
     echo "===================================================="
-    $CC "${BASE_CFLAGS[@]}" -fanalyzer "${INCLUDES[@]}" -c "${SRCS[@]}" tests/test_pdfcli.c
+    $CC "${BASE_CFLAGS[@]}" -fanalyzer "${INCLUDES[@]}" -c "${SRCS[@]}" tests/test_pdfcli.c tests/test_simulation.c
     rm -f *.o
     echo "===> GCC check passed with 0 errors and 0 warnings!"
 
@@ -144,9 +144,22 @@ do_lint() {
         echo "===> Running Clangd & Clang-Tidy at Max Strictness"
         echo "===================================================="
         echo "Using Clangd: $CLANGD"
-        for f in "${SRCS[@]}" tests/test_pdfcli.c; do
+        mkdir -p "$BUILD_DIR"
+        cat << EOF > "$BUILD_DIR/compile_commands.json"
+[
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/util.c", "file": "src/util.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/pdf.c", "file": "src/pdf.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/term.c", "file": "src/term.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/sixel.c", "file": "src/sixel.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/main.c", "file": "src/main.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c src/mupdf_opt.c", "file": "src/mupdf_opt.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c tests/test_pdfcli.c", "file": "tests/test_pdfcli.c" },
+  { "directory": "$REPO_ROOT", "command": "$CC $STD_FLAG -Wall -Wextra -Wpedantic ${INCLUDES[*]} -c tests/test_simulation.c", "file": "tests/test_simulation.c" }
+]
+EOF
+        for f in "${SRCS[@]}" tests/test_pdfcli.c tests/test_simulation.c; do
             echo "  [CLANGD] Checking $f..."
-            "$CLANGD" --check="$f" --clang-tidy --enable-config --tweaks="" 2>&1 | grep -E "All checks completed|FAIL|ERROR|error:" || true
+            "$CLANGD" --compile-commands-dir="$BUILD_DIR" --check="$f" --clang-tidy --tweaks="" 2>&1 | grep -E "All checks completed|FAIL|ERROR|error:" || true
         done
         echo "===> Clangd checks passed cleanly on the entire codebase!"
     else
@@ -192,8 +205,10 @@ do_test() {
     $CC "${ASAN_FLAGS[@]}" "${ASAN_OBJS[@]}" "${LIBS[@]}" -Wl,--gc-sections -o "$asan_app"
     echo -e "===> ASan & UBSan unit checks passed cleanly (0 leaks, 0 errors)!\n"
 
-    echo "===> Running Interactive PTY Terminal Simulation on ASan binary..."
-    PDFCLI_BIN="$asan_app" python3 tests/test_simulation.py
+    echo "===> Building & Running Interactive PTY Terminal Simulation on ASan binary..."
+    local sim_bin="$BUILD_DIR/test_simulation"
+    $CC "${BASE_CFLAGS[@]}" tests/test_simulation.c -o "$sim_bin"
+    "$sim_bin" "$asan_app"
     echo "===> Simulation suite passed cleanly under ASan!"
 
     echo -e "\n===> Running Linter Checks (GCC -fanalyzer & Clangd)..."
@@ -201,66 +216,7 @@ do_test() {
 }
 
 do_clean() {
-    rm -rf "$BUILD_DIR" "$BINARY" compile_commands.json .clangd
-    # Regenerate compilation database for tools
-    cat << 'EOF' > compile_commands.json
-[
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c src/util.c",
-    "file": "src/util.c"
-  },
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c src/pdf.c",
-    "file": "src/pdf.c"
-  },
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c src/term.c",
-    "file": "src/term.c"
-  },
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c src/sixel.c",
-    "file": "src/sixel.c"
-  },
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c src/main.c",
-    "file": "src/main.c"
-  },
-  {
-    "directory": "/home/aditya/pdf-cli",
-    "command": "gcc -std=c23 -Wall -Wextra -Wpedantic -Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include -c tests/test_pdfcli.c",
-    "file": "tests/test_pdfcli.c"
-  }
-]
-EOF
-    cat << 'EOF' > .clangd
-CompileFlags:
-  Add:
-    - -std=c23
-    - -Wall
-    - -Wextra
-    - -Wpedantic
-    - -Wshadow
-    - -Wconversion
-    - -Wsign-conversion
-
-Diagnostics:
-  ClangTidy:
-    Add:
-      - bugprone-*
-      - cert-*
-      - clang-analyzer-*
-      - misc-*
-      - performance-*
-      - readability-*
-    Remove:
-      - readability-identifier-length
-      - readability-function-cognitive-complexity
-EOF
+    rm -rf "$BUILD_DIR" "$BINARY"
     echo "===> Clean complete."
 }
 
