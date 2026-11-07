@@ -107,6 +107,96 @@ static void write_extreme_dim_pdf(const char *path) {
     fclose(f);
 }
 
+static void write_cjk_test_pdf(const char *path) {
+    FILE *f = fopen(path, "wb");
+    TEST_CHECK(f != NULL, "Failed to open cjk test PDF");
+    fprintf(f,
+        "%%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
+        "4 0 obj\n<< /Length 33 >>\nstream\nBT /F1 24 Tf 30 700 Td <41> Tj ET\nendstream\nendobj\n"
+        "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /HeiseiKakuGo-W5 /Encoding /90ms-RKSJ-H /DescendantFonts [6 0 R] >>\nendobj\n"
+        "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /HeiseiKakuGo-W5 /CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 2 >> >>\nendobj\n"
+        "xref\n0 7\n"
+        "0000000000 65535 f \n"
+        "0000000009 00000 n \n"
+        "0000000058 00000 n \n"
+        "0000000115 00000 n \n"
+        "0000000241 00000 n \n"
+        "0000000324 00000 n \n"
+        "0000000448 00000 n \n"
+        "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n603\n%%%%EOF\n");
+    fclose(f);
+}
+
+static void write_inherited_test_pdf(const char *path) {
+    FILE *f = fopen(path, "wb");
+    TEST_CHECK(f != NULL, "Failed to open inherited test PDF");
+    fprintf(f,
+        "%%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
+        "4 0 obj\n<< /Length 32 >>\nstream\nBT /F1 24 Tf 30 700 Td (A) Tj ET\nendstream\nendobj\n"
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>\nendobj\n"
+        "6 0 obj\n<< /Length 282 /UseCMap 7 0 R >>\nstream\n"
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /Child def /CMapType 2 def 1 begincodespacerange <00> <ff> endcodespacerange endcmap CMapName currentdict /CMap defineresource pop end end\n"
+        "endstream\nendobj\n"
+        "7 0 obj\n<< /Length 317 >>\nstream\n"
+        "/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def /CMapName /Base def /CMapType 2 def 1 begincodespacerange <00> <ff> endcodespacerange 1 beginbfchar <41> <005A> endbfchar endcmap CMapName currentdict /CMap defineresource pop end end\n"
+        "endstream\nendobj\n"
+        "xref\n0 8\n"
+        "0000000000 65535 f \n"
+        "0000000009 00000 n \n"
+        "0000000058 00000 n \n"
+        "0000000115 00000 n \n"
+        "0000000241 00000 n \n"
+        "0000000323 00000 n \n"
+        "0000000410 00000 n \n"
+        "0000000758 00000 n \n"
+        "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n1127\n%%%%EOF\n");
+    fclose(f);
+}
+
+static void write_dense_search_pdf(const char *path) {
+    FILE *f = fopen(path, "wb");
+    TEST_CHECK(f != NULL, "Failed to open dense test PDF");
+    fprintf(f,
+        "%%PDF-1.4\n"
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n");
+
+    char stream[4096] = "BT /F1 12 Tf ";
+    for (int i = 0; i < 40; i++) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "10 %d Td (MATCH) Tj ", 750 - (i * 15));
+        strcat(stream, buf);
+    }
+    strcat(stream, "ET\n");
+
+    long s_len = (long)strlen(stream);
+    long p4 = ftell(f);
+    fprintf(f, "4 0 obj\n<< /Length %ld >>\nstream\n%sendstream\nendobj\n", s_len, stream);
+
+    long p5 = ftell(f);
+    fprintf(f, "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n");
+
+    long xref = ftell(f);
+    fprintf(f,
+        "xref\n0 6\n"
+        "0000000000 65535 f \n"
+        "0000000009 00000 n \n"
+        "0000000058 00000 n \n"
+        "0000000115 00000 n \n"
+        "%010ld 00000 n \n"
+        "%010ld 00000 n \n"
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n%ld\n%%%%EOF\n",
+        p4, p5, xref);
+    fclose(f);
+}
+
 int main(void) {
     printf("====================================================\n");
     printf("===> Running Comprehensive pdf-cli Strictness Suite\n");
@@ -134,7 +224,7 @@ int main(void) {
     TEST_CHECK(pdf_get_toc(NULL, &toc_cnt) == NULL && toc_cnt == 0, "TOC on NULL must return NULL");
     pdf_free_toc(NULL, 0);
     size_t srch_cnt = 99;
-    TEST_CHECK(pdf_search_text(NULL, "test", &srch_cnt) == NULL && srch_cnt == 0, "Search on NULL must return NULL");
+    TEST_CHECK(pdf_search_text(NULL, "test", &srch_cnt, NULL) == NULL && srch_cnt == 0, "Search on NULL must return NULL");
     pdf_free_search(NULL);
     printf(" PASSED\n");
 
@@ -173,12 +263,13 @@ int main(void) {
     printf("  [TEST 5] In-document text search across multiple pages...");
     fflush(stdout);
     size_t hits_found = 0;
-    search_hit_t *hits = pdf_search_text(doc, "Continuous", &hits_found);
-    TEST_CHECK(hits != NULL && hits_found == 1 && hits[0].page == 0, "Found 'Continuous' on page 0");
+    search_status_t status = SEARCH_OK;
+    search_hit_t *hits = pdf_search_text(doc, "Continuous", &hits_found, &status);
+    TEST_CHECK(hits != NULL && hits_found == 1 && hits[0].page == 0 && status == SEARCH_OK, "Found 'Continuous' on page 0");
     pdf_free_search(hits);
 
-    search_hit_t *hits2 = pdf_search_text(doc, "Smoothly", &hits_found);
-    TEST_CHECK(hits2 != NULL && hits_found == 1 && hits2[0].page == 1, "Found 'Smoothly' on page 1");
+    search_hit_t *hits2 = pdf_search_text(doc, "Smoothly", &hits_found, &status);
+    TEST_CHECK(hits2 != NULL && hits_found == 1 && hits2[0].page == 1 && status == SEARCH_OK, "Found 'Smoothly' on page 1");
     pdf_free_search(hits2);
     printf(" PASSED\n");
 
@@ -295,11 +386,60 @@ int main(void) {
     TEST_CHECK(utf8_str_width(trunc_buf) <= 8, "Truncated string fits in 8 columns");
     printf(" PASSED\n");
 
+    // Test 13: Standard Predefined CMap PDF Rendering (CJK Fonts, Audit F01)
+    printf("  [TEST 13] Standard predefined CMap PDF rendering without crash...");
+    fflush(stdout);
+    char cjk_pdf[512];
+    snprintf(cjk_pdf, sizeof(cjk_pdf), "%s/cjk.pdf", temp_dir);
+    write_cjk_test_pdf(cjk_pdf);
+    pdf_doc_t *cjk_doc = pdf_open(cjk_pdf);
+    TEST_CHECK(cjk_doc != NULL, "Opened CJK test PDF");
+    fz_pixmap *cjk_pix = pdf_render_viewport(cjk_doc, 0, 1.0, 0, 100, 100, false);
+    TEST_CHECK(cjk_pix != NULL, "Rendered CJK page cleanly without crash");
+    fz_drop_pixmap(cjk_doc->ctx, cjk_pix);
+    pdf_close(cjk_doc);
+    printf(" PASSED\n");
+
+    // Test 14: Inherited /UseCMap Embedded CMap Text Search (Audit F04)
+    printf("  [TEST 14] Inherited /UseCMap embedded CMap text search...");
+    fflush(stdout);
+    char inh_pdf[512];
+    snprintf(inh_pdf, sizeof(inh_pdf), "%s/inherited.pdf", temp_dir);
+    write_inherited_test_pdf(inh_pdf);
+    pdf_doc_t *inh_doc = pdf_open(inh_pdf);
+    TEST_CHECK(inh_doc != NULL, "Opened inherited CMap test PDF");
+    size_t inh_hits = 0;
+    search_status_t inh_status = SEARCH_OK;
+    search_hit_t *hits_inh = pdf_search_text(inh_doc, "Z", &inh_hits, &inh_status);
+    TEST_CHECK(hits_inh != NULL && inh_hits == 1 && inh_status == SEARCH_OK, "Found inherited CMap character 'Z'");
+    pdf_free_search(hits_inh);
+    pdf_close(inh_doc);
+    printf(" PASSED\n");
+
+    // Test 15: Dense Text Search & Status Reporting (>32 matches, Audit F07, F09)
+    printf("  [TEST 15] Dense text search with >32 matches per page & status reporting...");
+    fflush(stdout);
+    char dense_pdf[512];
+    snprintf(dense_pdf, sizeof(dense_pdf), "%s/dense.pdf", temp_dir);
+    write_dense_search_pdf(dense_pdf);
+    pdf_doc_t *dense_doc = pdf_open(dense_pdf);
+    TEST_CHECK(dense_doc != NULL, "Opened dense search test PDF");
+    size_t dense_hits = 0;
+    search_status_t dense_status = SEARCH_OK;
+    search_hit_t *hits_dense = pdf_search_text(dense_doc, "MATCH", &dense_hits, &dense_status);
+    TEST_CHECK(hits_dense != NULL && dense_hits == 40 && dense_status == SEARCH_OK, "Found all 40 occurrences without 32-quad truncation");
+    pdf_free_search(hits_dense);
+    pdf_close(dense_doc);
+    printf(" PASSED\n");
+
     // Clean up temporary test files
     unlink(sample_pdf);
     unlink(mixed_pdf);
     unlink(zero_pdf);
     unlink(extreme_pdf);
+    unlink(cjk_pdf);
+    unlink(inh_pdf);
+    unlink(dense_pdf);
     rmdir(temp_dir);
 
     printf("====================================================\n");

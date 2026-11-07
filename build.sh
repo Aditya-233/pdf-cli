@@ -18,7 +18,7 @@ else
 fi
 
 # Host architecture tuning override
-ARCH_FLAGS="${ARCH_FLAGS:--march=native}"
+ARCH_FLAGS="${ARCH_FLAGS- -march=native}"
 if ! $CC $ARCH_FLAGS -E -x c /dev/null -o /dev/null 2>/dev/null; then
     ARCH_FLAGS=""
 fi
@@ -26,7 +26,7 @@ fi
 WARN_FLAGS=(-Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wshadow -Wstrict-prototypes -Wmissing-prototypes -Wundef -Wformat=2 -Wvla -Wnull-dereference -Wdouble-promotion)
 BASE_CFLAGS=("$STD_FLAG" -O3 $ARCH_FLAGS "${WARN_FLAGS[@]}" -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE)
 EXTRA_CPPFLAGS=(-ffunction-sections -fdata-sections)
-EXTRA_LDFLAGS=(-no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1 -Wl,--build-id=none)
+EXTRA_LDFLAGS=(-no-pie -Wl,--gc-sections -Wl,--as-needed -Wl,-O1)
 
 INCLUDES=(-Iinclude -isystem depends/go-fitz/include -isystem depends/libsixel/include)
 BINARY="${BINARY:-pdf-cli}"
@@ -39,41 +39,57 @@ prepare_opt_libs() {
     local lib_dir="$BUILD_DIR/libs"
     local opt_mupdf="$lib_dir/libmupdf_opt.a"
     local opt_third="$lib_dir/libthird_opt.a"
+    local hash_file="$lib_dir/.lib_prune_hash"
     mkdir -p "$lib_dir"
 
-    if [[ ! -f "$opt_mupdf" || depends/go-fitz/libs/libmupdf_linux_amd64.a -nt "$opt_mupdf" ]]; then
-        echo "  [OPT] Preparing streamlined MuPDF static library in $lib_dir..."
-        cp depends/go-fitz/libs/libmupdf_linux_amd64.a "$opt_mupdf"
-        ar d "$opt_mupdf" \
-            hyph-all.zip.o pdf-cmap-load.o html-parse.o html-layout.o css-apply.o \
-            svg-run.o svg-device.o pdf-js.o pdf-write.o \
-            xps-common.o xps-doc.o xps-glyphs.o xps-gradient.o xps-image.o xps-link.o xps-outline.o xps-path.o xps-resource.o xps-tile.o xps-util.o xps-zip.o \
-            svg-color.o svg-doc.o svg-parse.o css-parse.o epub-doc.o html-doc.o html-font.o html-outline.o md.o mobi.o office.o txt.o xml-dom.o reflow-doc.o mucbz.o muimg.o \
-            NimbusBoxes-Regular.cff.o CharisSIL-Bold.cff.o CharisSIL-BoldItalic.cff.o CharisSIL-Italic.cff.o CharisSIL.cff.o \
-            barcode.o zxingbarcode.o tessocr.o ocr-device.o output-cbz.o output-csv.o output-docx.o output-jpeg.o output-pcl.o output-pclm.o \
-            output-pdfocr.o output-png.o output-pnm.o output-ps.o output-psd.o output-pwg.o output-svg.o gz-doc.o unlibarchive.o untar.o uncfb.o \
-            load-bmp.o load-gif.o load-pnm.o load-psd.o load-tiff.o load-jxr.o stext-table.o stext-raft.o stext-boxer.o stext-classify.o \
-            pdf-clean.o pdf-clean-file.o pdf-recolor.o pdf-shade-recolor.o pdf-zugferd.o \
-            document-all.o story-writer.o writer.o xml-write.o pdf-af.o pdf-graft.o pdf-subset.o subset-cff.o subset-ttf.o pdf-op-vectorize.o \
-            test-device.o trace-device.o xmltext-device.o track-usage.o memento.o leptonica-wrap.o skew.o deskew.o warp.o getopt.o 2>/dev/null || true
+    local mupdf_del=(
+        hyph-all.zip.o html-parse.o html-layout.o css-apply.o \
+        svg-run.o svg-device.o pdf-js.o pdf-write.o \
+        xps-common.o xps-doc.o xps-glyphs.o xps-gradient.o xps-image.o xps-link.o xps-outline.o xps-path.o xps-resource.o xps-tile.o xps-util.o xps-zip.o \
+        svg-color.o svg-doc.o svg-parse.o css-parse.o epub-doc.o html-doc.o html-font.o html-outline.o md.o mobi.o office.o txt.o xml-dom.o reflow-doc.o mucbz.o muimg.o \
+        NimbusBoxes-Regular.cff.o CharisSIL-Bold.cff.o CharisSIL-BoldItalic.cff.o CharisSIL-Italic.cff.o CharisSIL.cff.o \
+        barcode.o zxingbarcode.o tessocr.o ocr-device.o output-cbz.o output-csv.o output-docx.o output-jpeg.o output-pcl.o output-pclm.o \
+        output-pdfocr.o output-png.o output-pnm.o output-ps.o output-psd.o output-pwg.o output-svg.o gz-doc.o unlibarchive.o untar.o uncfb.o \
+        load-bmp.o load-gif.o load-pnm.o load-psd.o load-tiff.o load-jxr.o stext-table.o stext-raft.o stext-boxer.o stext-classify.o \
+        pdf-clean.o pdf-clean-file.o pdf-recolor.o pdf-shade-recolor.o pdf-zugferd.o \
+        document-all.o story-writer.o writer.o xml-write.o pdf-af.o pdf-graft.o pdf-subset.o subset-cff.o subset-ttf.o pdf-op-vectorize.o \
+        test-device.o trace-device.o xmltext-device.o track-usage.o memento.o leptonica-wrap.o skew.o deskew.o warp.o getopt.o
+    )
+
+    local third_del=(
+        hb-subset-table-layout.o hb-subset-table-color.o hb-subset-table-var.o hb-subset-table-other.o hb-subset.o hb-subset-table-cff.o \
+        hb-subset-plan.o hb-subset-cff2.o hb-subset-cff1.o hb-subset-plan-var.o hb-subset-plan-layout.o one.o char_ref.o tokenizer.o parser.o houdini_html_u.o \
+        arena.o blocks.o buffer.o cmark.o cmark_ctype.o footnotes.o houdini_href_e.o houdini_html_e.o html.o inlines.o iterator.o linked_list.o map.o \
+        node.o plugin.o references.o registry.o scanners.o syntax_extension.o utf8.o autolink.o core-extensions.o ext_scanners.o strikethrough.o \
+        table.o tagfilter.o tasklist.o autoheaderid.o docx.o docx_template.o odt.o odt_template.o boxer.o extract.o join.o outf.o rect.o sys.o \
+        hb-subset-cff-common.o hb-subset-input.o hb-subset-instancer-iup.o hb-subset-instancer-solver.o \
+        adler32.o compress.o crc32.o deflate.o inffast.o inflate.o inftrees.o trees.o uncompr.o zutil.o \
+        jaricom.o jcapimin.o jcapistd.o jcarith.o jccoefct.o jccolor.o jcdctmgr.o jchuff.o jcinit.o jcmainct.o jcmarker.o jcmaster.o jcomapi.o \
+        jcparam.o jcprepct.o jcsample.o jdapimin.o jdapistd.o jdarith.o jdatadst.o jdatasrc.o jdcoefct.o jdcolor.o jddctmgr.o jdhuff.o jdinput.o \
+        jdmainct.o jdmarker.o jdmaster.o jdmerge.o jdpostct.o jdsample.o jdtrans.o jerror.o jfdctflt.o jfdctfst.o jfdctint.o jidctflt.o jidctfst.o \
+        jidctint.o jmemmgr.o jquant1.o jquant2.o jutils.o \
+        alloc.o astring.o buffer.o document.o json.o mem.o html.o text.o xml.o zip.o
+    )
+
+    local current_prune_hash="${mupdf_del[*]} ||| ${third_del[*]}"
+    local need_rebuild=0
+    if [[ ! -f "$opt_mupdf" || ! -f "$opt_third" ]]; then
+        need_rebuild=1
+    elif [[ depends/go-fitz/libs/libmupdf_linux_amd64.a -nt "$opt_mupdf" || depends/go-fitz/libs/libmupdfthird_linux_amd64.a -nt "$opt_third" ]]; then
+        need_rebuild=1
+    elif [[ ! -f "$hash_file" || "$(cat "$hash_file")" != "$current_prune_hash" ]]; then
+        need_rebuild=1
     fi
 
-    if [[ ! -f "$opt_third" || depends/go-fitz/libs/libmupdfthird_linux_amd64.a -nt "$opt_third" ]]; then
-        echo "  [OPT] Preparing streamlined third-party static library in $lib_dir..."
+    if [[ "$need_rebuild" -eq 1 ]]; then
+        echo "  [OPT] Preparing streamlined MuPDF and third-party static libraries in $lib_dir..."
+        cp depends/go-fitz/libs/libmupdf_linux_amd64.a "$opt_mupdf"
+        ar d "$opt_mupdf" "${mupdf_del[@]}" 2>/dev/null || true
+
         cp depends/go-fitz/libs/libmupdfthird_linux_amd64.a "$opt_third"
-        ar d "$opt_third" \
-            hb-subset-table-layout.o hb-subset-table-color.o hb-subset-table-var.o hb-subset-table-other.o hb-subset.o hb-subset-table-cff.o \
-            hb-subset-plan.o hb-subset-cff2.o hb-subset-cff1.o hb-subset-plan-var.o hb-subset-plan-layout.o one.o char_ref.o tokenizer.o parser.o houdini_html_u.o \
-            arena.o blocks.o buffer.o cmark.o cmark_ctype.o footnotes.o houdini_href_e.o houdini_html_e.o html.o inlines.o iterator.o linked_list.o map.o \
-            node.o plugin.o references.o registry.o scanners.o syntax_extension.o utf8.o autolink.o core-extensions.o ext_scanners.o strikethrough.o \
-            table.o tagfilter.o tasklist.o autoheaderid.o docx.o docx_template.o odt.o odt_template.o boxer.o extract.o join.o outf.o rect.o sys.o \
-            hb-subset-cff-common.o hb-subset-input.o hb-subset-instancer-iup.o hb-subset-instancer-solver.o \
-            adler32.o compress.o crc32.o deflate.o inffast.o inflate.o inftrees.o trees.o uncompr.o zutil.o \
-            jaricom.o jcapimin.o jcapistd.o jcarith.o jccoefct.o jccolor.o jcdctmgr.o jchuff.o jcinit.o jcmainct.o jcmarker.o jcmaster.o jcomapi.o \
-            jcparam.o jcprepct.o jcsample.o jdapimin.o jdapistd.o jdarith.o jdatadst.o jdatasrc.o jdcoefct.o jdcolor.o jddctmgr.o jdhuff.o jdinput.o \
-            jdmainct.o jdmarker.o jdmaster.o jdmerge.o jdpostct.o jdsample.o jdtrans.o jerror.o jfdctflt.o jfdctfst.o jfdctint.o jidctflt.o jidctfst.o \
-            jidctint.o jmemmgr.o jquant1.o jquant2.o jutils.o \
-            alloc.o astring.o buffer.o document.o json.o mem.o html.o text.o xml.o zip.o 2>/dev/null || true
+        ar d "$opt_third" "${third_del[@]}" 2>/dev/null || true
+
+        echo "$current_prune_hash" > "$hash_file"
     fi
 }
 
@@ -135,8 +151,10 @@ do_lint() {
     echo "===================================================="
     echo "===> Running GCC at Maximum Strictness & -fanalyzer"
     echo "===================================================="
+    local lint_dir="$BUILD_DIR/lint"
+    mkdir -p "$lint_dir"
     $CC "${BASE_CFLAGS[@]}" -fanalyzer "${INCLUDES[@]}" -c "${SRCS[@]}" tests/test_pdfcli.c tests/test_simulation.c
-    rm -f *.o
+    mv *.o "$lint_dir/" 2>/dev/null || true
     echo "===> GCC check passed with 0 errors and 0 warnings!"
 
     if [[ -n "$CLANGD" && -x "$CLANGD" ]]; then
@@ -159,7 +177,17 @@ do_lint() {
 EOF
         for f in "${SRCS[@]}" tests/test_pdfcli.c tests/test_simulation.c; do
             echo "  [CLANGD] Checking $f..."
-            "$CLANGD" --compile-commands-dir="$BUILD_DIR" --check="$f" --clang-tidy --tweaks="" 2>&1 | grep -E "All checks completed|FAIL|ERROR|error:" || true
+            local out
+            if ! out="$("$CLANGD" --compile-commands-dir="$BUILD_DIR" --check="$f" --clang-tidy --tweaks="" 2>&1)"; then
+                echo "$out"
+                echo "Error: Clangd failed on $f"
+                exit 1
+            fi
+            echo "$out" | grep -E "All checks completed|FAIL|ERROR|error:" || true
+            if echo "$out" | grep -qE "FAIL|ERROR|error:"; then
+                echo "Error: Clangd detected error in $f"
+                exit 1
+            fi
         done
         echo "===> Clangd checks passed cleanly on the entire codebase!"
     else
@@ -170,9 +198,12 @@ EOF
 do_test() {
     do_build
 
+    local bin_cmd
+    [[ "$BINARY" = /* ]] && bin_cmd="$BINARY" || bin_cmd="./$BINARY"
+
     echo -e "\n===> Running smoke test..."
-    "./$BINARY" --help > /dev/null
-    "./$BINARY" --version
+    "$bin_cmd" --help > /dev/null
+    "$bin_cmd" --version
     echo -e "===> Smoke test passed!\n"
 
     echo "===> Building and running strictness unit test suite..."

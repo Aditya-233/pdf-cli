@@ -30,6 +30,7 @@ typedef struct {
     int last_h;
     int last_zoom_pct;
     fit_mode_t last_fit;
+    bool layout_dirty;
     char search_query[64];
     search_hit_t* search_hits;
     size_t search_hit_count;
@@ -51,6 +52,9 @@ static void ensure_page_bounds(tab_t* t, int page) {
     float h = b.y1 - b.y0;
     if (w < 1.0f || w > 50000.0f) w = 612.0f;
     if (h < 1.0f || h > 50000.0f) h = 792.0f;
+    if (t->page_pw[page] != w || t->page_ph[page] != h) {
+        t->layout_dirty = true;
+    }
     t->page_pw[page] = w;
     t->page_ph[page] = h;
 }
@@ -158,11 +162,13 @@ static void render_top_hud(const tab_t* tabs, int tab_count, int active_tab, int
         char s_info[128];
         char safe_q[32];
         sanitize_terminal_string(act->search_query, safe_q, sizeof(safe_q));
+        char trunc_q[32];
+        utf8_truncate_by_width(safe_q, 20, trunc_q, sizeof(trunc_q));
         if (act->search_hit_count > 0) {
-            snprintf(s_info, sizeof(s_info), " | [%zu/%zu] \"%.20s\"",
-                     act->search_hit_idx + 1, act->search_hit_count, safe_q);
+            snprintf(s_info, sizeof(s_info), " | [%zu/%zu] \"%s\"",
+                     act->search_hit_idx + 1, act->search_hit_count, trunc_q);
         } else {
-            snprintf(s_info, sizeof(s_info), " | [No match] \"%.20s\"", safe_q);
+            snprintf(s_info, sizeof(s_info), " | [No match] \"%s\"", trunc_q);
         }
         size_t cur_len = strlen(info);
         strncat(info, s_info, sizeof(info) - cur_len - 1);
@@ -189,6 +195,7 @@ static int find_tab_by_col(const tab_t* tabs, int tab_count, int active_tab, int
         char lbl[64];
         snprintf(lbl, sizeof(lbl), " %d: %s%s ", i + 1, trunc_name, (i == active_tab) ? "*" : "");
         int w = utf8_str_width(lbl);
+        if (cur_col + w >= cols - 30) break;
         if (col >= cur_col && col < cur_col + w) return i;
         cur_col += w;
     }
@@ -198,11 +205,12 @@ static int find_tab_by_col(const tab_t* tabs, int tab_count, int active_tab, int
 static bool update_tab_layout(tab_t* t, int total_w, int content_h) {
     if (!t || t->page_count <= 0 || total_w <= 0 || content_h <= 0) return false;
 
-    if (t->page_y && t->page_h && t->last_w == total_w && t->last_h == content_h &&
+    if (!t->layout_dirty && t->page_y && t->page_h && t->last_w == total_w && t->last_h == content_h &&
         t->last_zoom_pct == t->zoom_pct && t->last_fit == t->fit) {
         tab_set_scroll(t, t->virtual_y);
         return true;
     }
+    t->layout_dirty = false;
 
     if (!t->page_y || !t->page_h) {
         int64_t* new_y = (int64_t*)malloc(sizeof(int64_t) * (size_t)t->page_count);
@@ -222,7 +230,7 @@ static bool update_tab_layout(tab_t* t, int total_w, int content_h) {
     double rel_offset = 0.0;
     bool has_prev_layout = (t->last_w > 0 && t->last_h > 0 && t->page_h[0] > 0);
     if (has_prev_layout) {
-        cur_p = get_active_page(t);
+        cur_p = find_first_visible_page(t, t->virtual_y);
         if (t->page_h[cur_p] > 0) {
             rel_offset = (double)(t->virtual_y - t->page_y[cur_p]) / (double)t->page_h[cur_p];
             if (rel_offset < 0.0) rel_offset = 0.0;
@@ -290,18 +298,135 @@ static bool update_tab_layout(tab_t* t, int total_w, int content_h) {
     return true;
 }
 
+static fz_pixmap* s_vpix = nullptr;
+static int s_vpix_w = 0;
+static int s_vpix_h = 0;
+static fz_context* s_vpix_ctx = nullptr;
+
+static void main_free_buffers(void) {
+    if (s_vpix && s_vpix_ctx) {
+        fz_drop_pixmap(s_vpix_ctx, s_vpix);
+        s_vpix = nullptr;
+        s_vpix_w = 0;
+        s_vpix_h = 0;
+        s_vpix_ctx = nullptr;
+    }
+}
+
+static void draw_search_highlights(fz_pixmap* vpix, const tab_t* t, int px_w, int content_h_px) {
+    if (!vpix || !vpix->samples || !t || !t->search_hits || t->search_hit_count == 0) return;
+    double zoom = (double)t->zoom_pct / 100.0;
+
+    for (size_t h = 0; h < t->search_hit_count; h++) {
+        int p = t->search_hits[h].page;
+        if (p < 0 || p >= t->page_count) continue;
+        int64_t y0 = t->page_y[p], y1 = y0 + t->page_h[p];
+        if (y1 <= t->virtual_y || y0 >= t->virtual_y + content_h_px) continue;
+
+        float pw = t->page_pw[p];
+        float ph = t->page_ph[p];
+        double scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) * zoom
+                                             : fmin((double)px_w / (double)pw, (double)content_h_px / (double)ph) * zoom;
+        int page_pixel_w = checked_scale_to_int((double)pw, scale, 1, 1000000);
+        int page_pixel_h = checked_scale_to_int((double)ph, scale, 1, 1000000);
+
+        int slice_w = (page_pixel_w <= px_w) ? page_pixel_w : px_w;
+        int sx = 0, dst_x = 0;
+        if (page_pixel_w <= px_w) {
+            dst_x = (px_w - page_pixel_w) / 2;
+        } else {
+            sx = (int)t->virtual_x;
+            if (sx + slice_w > page_pixel_w) sx = page_pixel_w - slice_w;
+            if (sx < 0) sx = 0;
+        }
+
+        int64_t page_y0 = (t->fit != FIT_WIDTH && page_pixel_h < content_h_px)
+                              ? y0 + (content_h_px - page_pixel_h) / 2
+                              : y0;
+
+        fz_rect hr = t->search_hits[h].rect;
+        int bx0 = dst_x + (int)((double)hr.x0 * scale) - sx;
+        int bx1 = dst_x + (int)((double)hr.x1 * scale + 0.999) - sx;
+        int by0 = (int)(page_y0 + (int64_t)((double)hr.y0 * scale) - t->virtual_y);
+        int by1 = (int)(page_y0 + (int64_t)((double)hr.y1 * scale + 0.999) - t->virtual_y);
+
+        if (bx0 < 0) bx0 = 0;
+        if (bx1 > vpix->w) bx1 = vpix->w;
+        if (by0 < 0) by0 = 0;
+        if (by1 > vpix->h) by1 = vpix->h;
+        if (bx1 <= bx0 || by1 <= by0) continue;
+
+        bool is_active = (h == t->search_hit_idx);
+        unsigned char hr_c = is_active ? 255 : 220;
+        unsigned char hg_c = is_active ? 215 : 180;
+        unsigned char hb_c = 0;
+
+        for (int y = by0; y < by1; y++) {
+            unsigned char* row = vpix->samples + (size_t)y * (size_t)vpix->stride;
+            for (int x = bx0; x < bx1; x++) {
+                bool is_border = is_active && (y <= by0 + 1 || y >= by1 - 2 || x <= bx0 + 1 || x >= bx1 - 2);
+                if (is_border) {
+                    row[x * 3 + 0] = 255;
+                    row[x * 3 + 1] = 69;
+                    row[x * 3 + 2] = 0;
+                } else {
+                    row[x * 3 + 0] = (unsigned char)((row[x * 3 + 0] + hr_c) >> 1);
+                    row[x * 3 + 1] = (unsigned char)((row[x * 3 + 1] + hg_c) >> 1);
+                    row[x * 3 + 2] = (unsigned char)((row[x * 3 + 2] + hb_c) >> 1);
+                }
+            }
+        }
+    }
+}
+
+static void scroll_to_hit(tab_t* t, size_t hit_idx, int px_w, int content_h_px) {
+    if (!t || !t->search_hits || hit_idx >= t->search_hit_count || !t->page_y || !t->page_h) return;
+    int p = t->search_hits[hit_idx].page;
+    if (p < 0 || p >= t->page_count) return;
+    ensure_page_bounds(t, p);
+    float pw = t->page_pw[p];
+    float ph = t->page_ph[p];
+    double zoom = (double)t->zoom_pct / 100.0;
+    double scale = (t->fit == FIT_WIDTH) ? ((double)px_w / (double)pw) * zoom
+                                         : fmin((double)px_w / (double)pw, (double)content_h_px / (double)ph) * zoom;
+    int page_pixel_h = checked_scale_to_int((double)ph, scale, 1, 1000000);
+    int64_t y0 = t->page_y[p];
+    int64_t page_y0 = (t->fit != FIT_WIDTH && page_pixel_h < content_h_px)
+                          ? y0 + (content_h_px - page_pixel_h) / 2
+                          : y0;
+    fz_rect r = t->search_hits[hit_idx].rect;
+    int64_t hit_mid_y = page_y0 + (int64_t)(((double)r.y0 + (double)r.y1) * 0.5 * scale);
+    tab_set_scroll(t, hit_mid_y - content_h_px / 2);
+
+    int page_pixel_w = checked_scale_to_int((double)pw, scale, 1, 1000000);
+    if (page_pixel_w > px_w) {
+        int hit_mid_x = (int)(((double)r.x0 + (double)r.x1) * 0.5 * scale);
+        int64_t vx = hit_mid_x - px_w / 2;
+        if (vx < 0) vx = 0;
+        if (vx > t->max_scroll_x) vx = t->max_scroll_x;
+        t->virtual_x = vx;
+    }
+}
+
 static void render_frame(tab_t* tabs, int tab_count, int active_tab, bool show_hud) {
     if (tab_count <= 0 || active_tab < 0 || active_tab >= tab_count) return;
     tab_t* t = &tabs[active_tab];
 
     int cols = 0, rows = 0, px_w = 0, px_h = 0;
     term_get_size(&cols, &rows, &px_w, &px_h);
-    if (cols < 10 || rows < 3) return;
+    if (cols < 10 || rows < 3) {
+        printf("\033[1;1HTerminal too small (min 10x3)");
+        fflush(stdout);
+        return;
+    }
+
+    if (px_w > 16384) px_w = 16384;
 
     int content_rows = rows - (show_hud ? 1 : 0);
     if (content_rows < 1) content_rows = 1;
     int content_h_px = (int)((double)content_rows * ((double)px_h / rows) + 0.5);
     if (content_h_px < 1) content_h_px = 1;
+    if (content_h_px > 16384) content_h_px = 16384;
 
     if (!update_tab_layout(t, px_w, content_h_px)) return;
     if (!t->page_y || !t->page_h) return;
@@ -310,13 +435,25 @@ static void render_frame(tab_t* tabs, int tab_count, int active_tab, bool show_h
     printf("\033]11;%s\007", t->dark ? "#000000" : "#181818");
 
     fz_context* ctx = t->doc->ctx;
-    fz_pixmap* vpix = nullptr;
-    fz_var(vpix);
-    fz_try(ctx) {
-        vpix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_make_irect(0, 0, px_w, content_h_px), nullptr, 0);
-    } fz_catch(ctx) {
-        vpix = nullptr;
+    if (!s_vpix || s_vpix_w != px_w || s_vpix_h != content_h_px || s_vpix_ctx != ctx) {
+        if (s_vpix && s_vpix_ctx) {
+            fz_drop_pixmap(s_vpix_ctx, s_vpix);
+            s_vpix = nullptr;
+        }
+        fz_try(ctx) {
+            s_vpix = fz_new_pixmap_with_bbox(ctx, fz_device_rgb(ctx), fz_make_irect(0, 0, px_w, content_h_px), nullptr, 0);
+            s_vpix_w = px_w;
+            s_vpix_h = content_h_px;
+            s_vpix_ctx = ctx;
+        } fz_catch(ctx) {
+            s_vpix = nullptr;
+            s_vpix_w = 0;
+            s_vpix_h = 0;
+            s_vpix_ctx = nullptr;
+        }
     }
+
+    fz_pixmap* vpix = s_vpix;
 
     if (vpix) {
         fz_clear_pixmap_with_value(ctx, vpix, t->dark ? 0xFF : 0x18);
@@ -369,6 +506,8 @@ static void render_frame(tab_t* tabs, int tab_count, int active_tab, bool show_h
                                   (int)(v1 - v0), vpix, dst_x, (int)(v0 - t->virtual_y));
         }
 
+        draw_search_highlights(vpix, t, px_w, content_h_px);
+
         if (t->dark) {
             for (int y = 0; y < vpix->h; y++) {
                 unsigned char* row = vpix->samples + (size_t)y * (size_t)vpix->stride;
@@ -379,10 +518,6 @@ static void render_frame(tab_t* tabs, int tab_count, int active_tab, bool show_h
         }
 
         sixel_draw(vpix, 1, show_hud ? 2 : 1);
-        fz_drop_pixmap(ctx, vpix);
-        fz_empty_store(ctx);
-        fz_purge_glyph_cache(ctx);
-        malloc_trim(0);
     }
 
     if (show_hud) render_top_hud(tabs, tab_count, active_tab, cols);
@@ -612,8 +747,13 @@ static void show_toc_modal(tab_t* tabs, int tab_count, int active_tab, bool show
     render_frame(tabs, tab_count, active_tab, show_hud);
 }
 
-static bool prompt_input(const char* prompt, char* buf, size_t maxlen) {
-    if (!prompt || !buf || maxlen == 0) return false;
+typedef enum {
+    PROMPT_CANCELLED = 0,
+    PROMPT_SUBMITTED = 1
+} prompt_result_t;
+
+static prompt_result_t prompt_input(const char* prompt, char* buf, size_t maxlen) {
+    if (!prompt || !buf || maxlen == 0) return PROMPT_CANCELLED;
     int rows = 0;
     term_get_size(nullptr, &rows, nullptr, nullptr);
     if (rows < 1) rows = 24;
@@ -622,20 +762,25 @@ static bool prompt_input(const char* prompt, char* buf, size_t maxlen) {
     buf[0] = '\0';
     fputs("\033[?25h", stdout);
 
-    bool submitted = false;
+    prompt_result_t res = PROMPT_CANCELLED;
     while (true) {
         printf("\033[%d;1H\033[7m %s%s \033[0m\033[K", rows, prompt, buf);
         fflush(stdout);
 
         int ch = term_read_key(500, nullptr, nullptr);
         if (ch == KEY_NONE) continue;
+        if (ch == KEY_RESIZE) {
+            term_get_size(nullptr, &rows, nullptr, nullptr);
+            if (rows < 1) rows = 24;
+            continue;
+        }
         if (ch == KEY_EOF || ch == KEY_ESC || ch == KEY_CTRL_C || ch == 3) {
             buf[0] = '\0';
-            len = 0;
+            res = PROMPT_CANCELLED;
             break;
         }
         if (ch == '\r' || ch == '\n') {
-            submitted = true;
+            res = PROMPT_SUBMITTED;
             break;
         }
         if ((ch == 127 || ch == 8) && len > 0) {
@@ -645,52 +790,80 @@ static bool prompt_input(const char* prompt, char* buf, size_t maxlen) {
             if (i > 0) i--;
             len = i;
             buf[len] = '\0';
-        } else if (ch >= 32 && ch <= 255 && len + 1 < maxlen) {
+        } else if (ch >= 32 && ch <= 126 && len + 1 < maxlen) {
             buf[len++] = (char)ch;
             buf[len] = '\0';
+        } else if (ch >= 0xC2 && ch <= 0xF4) {
+            int need = (ch < 0xE0) ? 1 : ((ch < 0xF0) ? 2 : 3);
+            if (len + (size_t)need + 1 < maxlen) {
+                char seq[4];
+                seq[0] = (char)ch;
+                bool valid = true;
+                for (int b = 1; b <= need; b++) {
+                    int c_byte = term_read_key(25, nullptr, nullptr);
+                    if (c_byte >= 0x80 && c_byte <= 0xBF) {
+                        seq[b] = (char)c_byte;
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (valid) {
+                    for (int b = 0; b <= need; b++) buf[len++] = seq[b];
+                    buf[len] = '\0';
+                }
+            }
         }
     }
 
     fputs("\033[?25l", stdout);
     fflush(stdout);
-    return submitted && len > 0;
+    return res;
 }
 
 static void show_search_prompt(tab_t* tabs, int tab_count, int active_tab, bool show_hud) {
     tab_t* t = &tabs[active_tab];
     char query[64] = {0};
-    if (prompt_input("Search:", query, sizeof(query))) {
-        char safe_q[sizeof(t->search_query)];
-        sanitize_terminal_string(query, safe_q, sizeof(safe_q));
-        snprintf(t->search_query, sizeof(t->search_query), "%s", safe_q);
-
-        if (t->search_hits) {
-            pdf_free_search(t->search_hits);
-            t->search_hits = nullptr;
-        }
-        t->search_hits = pdf_search_text(t->doc, query, &t->search_hit_count);
-        t->search_hit_idx = 0;
-
-        if (t->search_hit_count > 0) {
-            int cur_p = get_active_page(t);
-            for (size_t i = 0; i < t->search_hit_count; i++) {
-                if (t->search_hits[i].page >= cur_p) {
-                    t->search_hit_idx = i;
-                    break;
-                }
+    prompt_result_t res = prompt_input("Search:", query, sizeof(query));
+    if (res == PROMPT_SUBMITTED) {
+        if (query[0] == '\0') {
+            // Clear search on empty submission
+            t->search_query[0] = '\0';
+            if (t->search_hits) {
+                pdf_free_search(t->search_hits);
+                t->search_hits = nullptr;
             }
-            int p = t->search_hits[t->search_hit_idx].page;
-            if (p >= 0 && p < t->page_count && t->page_y) tab_set_scroll(t, t->page_y[p]);
+            t->search_hit_count = 0;
+            t->search_hit_idx = 0;
+        } else {
+            char safe_q[sizeof(t->search_query)];
+            sanitize_terminal_string(query, safe_q, sizeof(safe_q));
+            snprintf(t->search_query, sizeof(t->search_query), "%s", safe_q);
+
+            if (t->search_hits) {
+                pdf_free_search(t->search_hits);
+                t->search_hits = nullptr;
+            }
+            search_status_t status = SEARCH_OK;
+            t->search_hits = pdf_search_text(t->doc, query, &t->search_hit_count, &status);
+            t->search_hit_idx = 0;
+
+            if (t->search_hit_count > 0) {
+                int cur_p = get_active_page(t);
+                for (size_t i = 0; i < t->search_hit_count; i++) {
+                    if (t->search_hits[i].page >= cur_p) {
+                        t->search_hit_idx = i;
+                        break;
+                    }
+                }
+                int cols = 0, rows = 0, px_w = 0, px_h = 0;
+                term_get_size(&cols, &rows, &px_w, &px_h);
+                int content_rows = rows - (show_hud ? 1 : 0);
+                if (content_rows < 1) content_rows = 1;
+                int content_h_px = (int)((double)content_rows * ((double)px_h / (rows > 0 ? rows : 24)) + 0.5);
+                scroll_to_hit(t, t->search_hit_idx, px_w, content_h_px);
+            }
         }
-    } else if (query[0] == '\0') {
-        // Clear search on empty submission
-        t->search_query[0] = '\0';
-        if (t->search_hits) {
-            pdf_free_search(t->search_hits);
-            t->search_hits = nullptr;
-        }
-        t->search_hit_count = 0;
-        t->search_hit_idx = 0;
     }
     render_frame(tabs, tab_count, active_tab, show_hud);
 }
@@ -699,7 +872,8 @@ static void show_page_jump_prompt(tab_t* tabs, int tab_count, int active_tab, bo
     tab_t* t = &tabs[active_tab];
     char num[16] = {0}, prompt[32];
     snprintf(prompt, sizeof(prompt), "Go to page (1-%d):", t->page_count);
-    if (prompt_input(prompt, num, sizeof(num))) {
+    prompt_result_t res = prompt_input(prompt, num, sizeof(num));
+    if (res == PROMPT_SUBMITTED && num[0] != '\0') {
         errno = 0;
         char* endptr = nullptr;
         long p = strtol(num, &endptr, 10);
@@ -721,6 +895,9 @@ static void free_tab(tab_t* t) {
     free(t->page_h);
     if (t->search_hits) pdf_free_search(t->search_hits);
     memset(t, 0, sizeof(*t));
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -790,7 +967,6 @@ int main(int argc, char** argv) {
     int tab_count = 0;
 
     for (int i = first_file_idx; i < argc; i++) {
-        if (!strcmp(argv[i], "--")) continue;
         if (tab_count >= MAX_TABS) {
             char safe_arg[128];
             sanitize_terminal_string(argv[i], safe_arg, sizeof(safe_arg));
@@ -901,8 +1077,6 @@ int main(int argc, char** argv) {
                 active_tab = target;
             else
                 redraw = false;
-        } else if (tab_count >= 10 && key == '0') {
-            active_tab = 9;
         } else if (key == KEY_CTRL_TAB || key == ']' || key == KEY_PGDN) {
             if (key == KEY_PGDN && t->virtual_y < t->max_scroll) {
                 tab_set_scroll(t, t->virtual_y + step_pg);
@@ -918,6 +1092,7 @@ int main(int argc, char** argv) {
                 redraw = false;
             }
         } else if (key == KEY_CTRL_W) {
+            main_free_buffers();
             free_tab(&tabs[active_tab]);
             for (int i = active_tab; i < tab_count - 1; i++) tabs[i] = tabs[i + 1];
             memset(&tabs[tab_count - 1], 0, sizeof(tab_t));
@@ -962,16 +1137,14 @@ int main(int argc, char** argv) {
         } else if (key == 'n' || key == 'J') {
             if (t->search_hit_count > 0) {
                 t->search_hit_idx = (t->search_hit_idx + 1) % t->search_hit_count;
-                int p = t->search_hits[t->search_hit_idx].page;
-                if (p >= 0 && p < t->page_count && t->page_y) tab_set_scroll(t, t->page_y[p]);
+                scroll_to_hit(t, t->search_hit_idx, px_w, content_h_px);
             } else {
                 next_page(t);
             }
         } else if (key == 'p' || key == 'N' || key == 'K') {
             if (t->search_hit_count > 0) {
                 t->search_hit_idx = (t->search_hit_idx + t->search_hit_count - 1) % t->search_hit_count;
-                int p = t->search_hits[t->search_hit_idx].page;
-                if (p >= 0 && p < t->page_count && t->page_y) tab_set_scroll(t, t->page_y[p]);
+                scroll_to_hit(t, t->search_hit_idx, px_w, content_h_px);
             } else {
                 prev_page(t);
             }
@@ -983,7 +1156,7 @@ int main(int argc, char** argv) {
             if (t->zoom_pct < MAX_ZOOM_PCT) t->zoom_pct += 10;
         } else if (key == '-' || key == '_') {
             if (t->zoom_pct > MIN_ZOOM_PCT) t->zoom_pct -= 10;
-        } else if (key == '0' && tab_count < 10) {
+        } else if (key == '0' || key == 'z' || key == 'Z') {
             t->zoom_pct = DEFAULT_ZOOM_PCT;
         } else if (key == 'g') {
             show_page_jump_prompt(tabs, tab_count, active_tab, show_hud);
@@ -1004,8 +1177,13 @@ int main(int argc, char** argv) {
 
     term_restore();
 
+    main_free_buffers();
     for (int i = 0; i < tab_count; i++) {
         free_tab(&tabs[i]);
     }
+    sixel_free_buffers();
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
     return 0;
 }

@@ -3,6 +3,20 @@
 #include <limits.h>
 #include <string.h>
 
+static unsigned char *s_cbuf = nullptr;
+static size_t s_cbuf_cap = 0;
+static unsigned char *s_indexed = nullptr;
+static size_t s_indexed_cap = 0;
+
+void sixel_free_buffers(void) {
+    free(s_cbuf);
+    s_cbuf = nullptr;
+    s_cbuf_cap = 0;
+    free(s_indexed);
+    s_indexed = nullptr;
+    s_indexed_cap = 0;
+}
+
 static int sixel_write_cb(char *data, int size, void *priv) {
     if (size <= 0) return 0;
     return (int)fwrite(data, 1, (size_t)size, (FILE *)priv);
@@ -35,8 +49,14 @@ bool sixel_draw(const fz_pixmap *pix, int col, int row) {
     bool needs_conversion = (pix->n == 4 || pix->n == 2 || pix->stride != (ptrdiff_t)pix->w * (ptrdiff_t)pix->n);
 
     if (needs_conversion) {
-        cbuf = (unsigned char *)malloc(total_px * comp);
-        if (!cbuf) goto cleanup;
+        size_t needed = total_px * comp;
+        if (needed > s_cbuf_cap) {
+            unsigned char *nb = (unsigned char *)realloc(s_cbuf, needed);
+            if (!nb) goto cleanup;
+            s_cbuf = nb;
+            s_cbuf_cap = needed;
+        }
+        cbuf = s_cbuf;
 
         for (int y = 0; y < pix->h; y++) {
             const unsigned char *src_row = pix->samples + (size_t)y * (size_t)pix->stride;
@@ -79,8 +99,13 @@ bool sixel_draw(const fz_pixmap *pix, int col, int row) {
         goto cleanup;
     }
 
-    indexed = (unsigned char *)malloc(total_px);
-    if (!indexed) goto cleanup;
+    if (total_px > s_indexed_cap) {
+        unsigned char *ni = (unsigned char *)realloc(s_indexed, total_px);
+        if (!ni) goto cleanup;
+        s_indexed = ni;
+        s_indexed_cap = total_px;
+    }
+    indexed = s_indexed;
 
     /*
      * Fast 15-bit RGB Color Quantization LUT:
@@ -147,8 +172,8 @@ bool sixel_draw(const fz_pixmap *pix, int col, int row) {
 cleanup:
     if (dither) sixel_dither_unref(dither);
     if (out) sixel_output_unref(out);
-    free(indexed);
-    free(cbuf);
-    fflush(stdout);
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        ok = false;
+    }
     return ok;
 }

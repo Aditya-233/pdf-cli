@@ -11,6 +11,7 @@ static struct termios s_orig_termios;
 static volatile sig_atomic_t s_raw_active = 0;
 static volatile sig_atomic_t s_resized = 0;
 static volatile sig_atomic_t s_suspended = 0;
+static volatile sig_atomic_t s_needs_reenter = 0;
 
 #define IN_BUF_CAP 1024
 static unsigned char s_in_buf[IN_BUF_CAP];
@@ -65,8 +66,8 @@ static void on_sigtstp(int sig) {
 static void on_sigcont(int sig) {
     (void)sig;
     if (s_suspended) {
-        term_enter_raw();
         s_suspended = 0;
+        s_needs_reenter = 1;
         s_resized = 1;
     }
 }
@@ -190,27 +191,43 @@ static int fill_in_buf(int timeout_ms) {
     }
     if (ret == 0) return 0;
 
+    if (pfd.revents & POLLIN) {
+        ssize_t n = read(STDIN_FILENO, s_in_buf + s_in_len, sizeof(s_in_buf) - s_in_len);
+        if (n > 0) {
+            s_in_len += (size_t)n;
+            return 1;
+        }
+        if (n == 0) return -1;
+        if (errno == EINTR) return 0;
+        return -1;
+    }
+
     if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
         return -1;
     }
 
-    if (pfd.revents & POLLIN) {
-        ssize_t n = read(STDIN_FILENO, s_in_buf + s_in_len, sizeof(s_in_buf) - s_in_len);
-        if (n == 0) return -1;
-        if (n < 0) {
-            if (errno == EINTR) return 0;
-            return -1;
-        }
-        s_in_len += (size_t)n;
-        return 1;
-    }
     return 0;
 }
 
 int term_read_key(int timeout_ms, int *mouse_col, int *mouse_row) {
+    if (s_needs_reenter) {
+        s_needs_reenter = 0;
+        struct termios raw = s_orig_termios;
+        raw.c_iflag &= (tcflag_t)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+        raw.c_oflag &= (tcflag_t)~(OPOST);
+        raw.c_cflag |= (CS8);
+        raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
+        raw.c_cc[VMIN] = 0;
+        raw.c_cc[VTIME] = 0;
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+        const char reinit[] = "\033[?1049h\033[?7l\033[?25l\033[?1000h\033[?1006h";
+        (void)write(STDOUT_FILENO, reinit, sizeof(reinit) - 1);
+        s_raw_active = 1;
+    }
+
     if (s_resized) {
         s_resized = 0;
-        return 'r';
+        return KEY_RESIZE;
     }
 
     if (s_in_len == 0) {
@@ -254,7 +271,37 @@ int term_read_key(int timeout_ms, int *mouse_col, int *mouse_row) {
             in_buf_consume(3);
             if (c == 'H') return KEY_HOME;
             if (c == 'F') return KEY_END;
+            if (c == 'A') return KEY_UP;
+            if (c == 'B') return KEY_DOWN;
+            if (c == 'C') return KEY_RIGHT;
+            if (c == 'D') return KEY_LEFT;
+            return KEY_NONE;
         }
+        in_buf_consume(s_in_len);
+        return KEY_NONE;
+    }
+
+    // Legacy Xterm Mouse: ESC [ M cb cx cy (intercept before generic CSI)
+    if (s_in_buf[1] == '[' && s_in_len >= 3 && s_in_buf[2] == 'M') {
+        while (s_in_len < 6) {
+            if (fill_in_buf(25) <= 0) break;
+        }
+        if (s_in_len >= 6) {
+            int btn = (unsigned char)s_in_buf[3] - 32;
+            int col = (unsigned char)s_in_buf[4] - 32;
+            int row = (unsigned char)s_in_buf[5] - 32;
+            in_buf_consume(6);
+            if (col >= 1 && col <= 4096 && row >= 1 && row <= 4096) {
+                if (mouse_col) *mouse_col = col;
+                if (mouse_row) *mouse_row = row;
+                int btn_code = btn & 0x43;
+                if (btn_code == 64) return KEY_WHEEL_UP;
+                if (btn_code == 65) return KEY_WHEEL_DOWN;
+                if (btn_code == 0) return KEY_MOUSE_LEFT;
+            }
+            return KEY_NONE;
+        }
+        in_buf_consume(s_in_len);
         return KEY_NONE;
     }
 
@@ -273,6 +320,10 @@ int term_read_key(int timeout_ms, int *mouse_col, int *mouse_row) {
         }
 
         if (term_pos == 0) {
+            if (s_in_len > 1) {
+                in_buf_consume(s_in_len);
+                return KEY_NONE;
+            }
             in_buf_consume(1);
             return KEY_ESC;
         }
@@ -289,25 +340,15 @@ int term_read_key(int timeout_ms, int *mouse_col, int *mouse_row) {
             int btn = 0, col = 0, row = 0;
             char type = 0;
             if (sscanf(seq + 3, "%d;%d;%d%c", &btn, &col, &row, &type) >= 4) {
-                if (mouse_col && col >= 1 && col <= 4096) *mouse_col = col;
-                if (mouse_row && row >= 1 && row <= 4096) *mouse_row = row;
-                if (btn == 64 && type == 'M') return KEY_WHEEL_UP;
-                if (btn == 65 && type == 'M') return KEY_WHEEL_DOWN;
-                if (btn == 0 && type == 'M') return KEY_MOUSE_LEFT;
+                if (col >= 1 && col <= 4096 && row >= 1 && row <= 4096 && btn >= 0 && btn <= 255) {
+                    if (mouse_col) *mouse_col = col;
+                    if (mouse_row) *mouse_row = row;
+                    int btn_code = btn & ~0x1C;
+                    if (btn_code == 64 && type == 'M') return KEY_WHEEL_UP;
+                    if (btn_code == 65 && type == 'M') return KEY_WHEEL_DOWN;
+                    if (btn_code == 0 && type == 'M') return KEY_MOUSE_LEFT;
+                }
             }
-            return KEY_NONE;
-        }
-
-        // Legacy Xterm Mouse: ESC [ M cb cx cy
-        if (seq[2] == 'M' && seq_len >= 6) {
-            int btn = (unsigned char)seq[3] - 32;
-            int col = (unsigned char)seq[4] - 32;
-            int row = (unsigned char)seq[5] - 32;
-            if (mouse_col && col >= 1) *mouse_col = col;
-            if (mouse_row && row >= 1) *mouse_row = row;
-            if (btn == 64) return KEY_WHEEL_UP;
-            if (btn == 65) return KEY_WHEEL_DOWN;
-            if (btn == 0) return KEY_MOUSE_LEFT;
             return KEY_NONE;
         }
 

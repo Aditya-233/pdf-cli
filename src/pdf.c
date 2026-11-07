@@ -12,8 +12,8 @@ static void dummy_warning_cb(void *user, const char *msg) {
 
 [[nodiscard]] pdf_doc_t *pdf_open(const char *path) {
     if (!path || !*path) return nullptr;
-    // Ultra low-footprint MuPDF context store: 0 KB cache store
-    fz_context *ctx = fz_new_context(nullptr, nullptr, 0);
+    // Bounded MuPDF context store budget to prevent memory runaway
+    fz_context *ctx = fz_new_context(nullptr, nullptr, PDFCLI_STORE_BUDGET);
     if (!ctx) return nullptr;
 
     fz_set_warning_callback(ctx, dummy_warning_cb, nullptr);
@@ -96,6 +96,21 @@ void pdf_close(pdf_doc_t *p) {
     free(p);
 }
 
+static fz_rect sanitize_page_bounds(fz_rect b) {
+    const fz_rect fallback_rect = { .x0 = 0.0f, .y0 = 0.0f, .x1 = 612.0f, .y1 = 792.0f };
+    if (isnan(b.x0) || isinf(b.x0) || isnan(b.x1) || isinf(b.x1) ||
+        isnan(b.y0) || isinf(b.y0) || isnan(b.y1) || isinf(b.y1) ||
+        b.x1 <= b.x0 || b.y1 <= b.y0) {
+        return fallback_rect;
+    }
+    float w = b.x1 - b.x0;
+    float h = b.y1 - b.y0;
+    if (w < 1.0f || w > 50000.0f || h < 1.0f || h > 50000.0f) {
+        return fallback_rect;
+    }
+    return b;
+}
+
 [[nodiscard]] fz_rect pdf_page_bounds(pdf_doc_t *p, int page) {
     const fz_rect fallback_rect = { .x0 = 0.0f, .y0 = 0.0f, .x1 = 612.0f, .y1 = 792.0f };
     if (!p || !p->ctx || !p->doc || page < 0 || page >= p->page_count) return (fz_rect){0};
@@ -108,7 +123,7 @@ void pdf_close(pdf_doc_t *p) {
     fz_try(p->ctx) {
         pg = fz_load_page(p->ctx, p->doc, page);
         if (pg) {
-            b = fz_bound_page(p->ctx, pg);
+            b = sanitize_page_bounds(fz_bound_page(p->ctx, pg));
         }
     } fz_always(p->ctx) {
         if (pg) {
@@ -119,18 +134,7 @@ void pdf_close(pdf_doc_t *p) {
         b = fallback_rect;
     }
 
-    // Validate bounds for finiteness, positive size, and reasonable limits
-    if (!isnan(b.x0) && !isinf(b.x0) && !isnan(b.x1) && !isinf(b.x1) &&
-        !isnan(b.y0) && !isinf(b.y0) && !isnan(b.y1) && !isinf(b.y1) &&
-        b.x1 > b.x0 && b.y1 > b.y0) {
-        float w = b.x1 - b.x0;
-        float h = b.y1 - b.y0;
-        if (w >= 1.0f && w <= 50000.0f && h >= 1.0f && h <= 50000.0f) {
-            return b;
-        }
-    }
-
-    return fallback_rect;
+    return b;
 }
 
 bool pdf_render_page_slice(pdf_doc_t *p, int page, double scale, int sx, int sy, int vw, int vh, fz_pixmap *dst, int dst_x, int dst_y) {
@@ -157,11 +161,7 @@ bool pdf_render_page_slice(pdf_doc_t *p, int page, double scale, int sx, int sy,
     fz_try(p->ctx) {
         pg = fz_load_page(p->ctx, p->doc, page);
         if (pg) {
-            fz_rect b = fz_bound_page(p->ctx, pg);
-            if (isnan(b.x0) || isinf(b.x0) || isnan(b.x1) || isinf(b.x1) ||
-                isnan(b.y0) || isinf(b.y0) || isnan(b.y1) || isinf(b.y1)) {
-                b = (fz_rect){ .x0 = 0.0f, .y0 = 0.0f, .x1 = 612.0f, .y1 = 792.0f };
-            }
+            fz_rect b = sanitize_page_bounds(fz_bound_page(p->ctx, pg));
 
             fz_matrix ctm = fz_concat(fz_translate(-b.x0, -b.y0),
                                       fz_concat(fz_scale((float)scale, (float)scale),
@@ -308,7 +308,8 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
     free(items);
 }
 
-[[nodiscard]] search_hit_t *pdf_search_text(pdf_doc_t *p, const char *needle, size_t *out_count) {
+[[nodiscard]] search_hit_t *pdf_search_text(pdf_doc_t *p, const char *needle, size_t *out_count, search_status_t *out_status) {
+    if (out_status) *out_status = SEARCH_OK;
     if (!out_count) return nullptr;
     *out_count = 0;
     if (!p || !p->ctx || !p->doc || !needle || !*needle) return nullptr;
@@ -316,7 +317,10 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
     const size_t MAX_SEARCH_HITS = 2000;
     size_t cap = 32;
     search_hit_t *hits = (search_hit_t *)malloc(cap * sizeof(search_hit_t));
-    if (!hits) return nullptr;
+    if (!hits) {
+        if (out_status) *out_status = SEARCH_ERROR;
+        return nullptr;
+    }
 
     size_t cnt = 0;
     fz_page *pg = nullptr;
@@ -330,8 +334,25 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
             pg = fz_load_page(p->ctx, p->doc, pg_idx);
             if (!pg) continue;
 
-            fz_quad quads[32];
-            int n = fz_search_page(p->ctx, pg, needle, nullptr, quads, 32);
+            int quad_cap = 64;
+            fz_quad *quads = (fz_quad *)malloc((size_t)quad_cap * sizeof(fz_quad));
+            if (!quads) {
+                if (out_status) *out_status = SEARCH_ERROR;
+                fz_drop_page(p->ctx, pg);
+                pg = nullptr;
+                break;
+            }
+
+            int n = fz_search_page(p->ctx, pg, needle, nullptr, quads, quad_cap);
+            while (n == quad_cap && quad_cap < 8192) {
+                int new_qcap = quad_cap * 2;
+                fz_quad *nq = (fz_quad *)realloc(quads, (size_t)new_qcap * sizeof(fz_quad));
+                if (!nq) break;
+                quads = nq;
+                quad_cap = new_qcap;
+                n = fz_search_page(p->ctx, pg, needle, nullptr, quads, quad_cap);
+            }
+
             for (int m = 0; m < n && cnt < MAX_SEARCH_HITS; m++) {
                 if (cnt >= cap) {
                     size_t new_cap = cap * 2;
@@ -339,7 +360,10 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
                     if (new_cap <= cnt) break;
 
                     search_hit_t *new_hits = (search_hit_t *)realloc(hits, new_cap * sizeof(search_hit_t));
-                    if (!new_hits) break;
+                    if (!new_hits) {
+                        if (out_status) *out_status = SEARCH_ERROR;
+                        break;
+                    }
                     hits = new_hits;
                     cap = new_cap;
                 }
@@ -348,26 +372,26 @@ void pdf_free_toc(toc_item_t *items, size_t count) {
                 cnt++;
             }
 
+            if (cnt >= MAX_SEARCH_HITS && (pg_idx + 1 < p->page_count || n > (int)cnt)) {
+                if (out_status) *out_status = SEARCH_TRUNCATED;
+            }
+
+            free(quads);
             fz_drop_page(p->ctx, pg);
             pg = nullptr;
-
-            // Empty context store periodically to keep RAM under strict control
-            if ((pg_idx % 5) == 0) {
-                fz_empty_store(p->ctx);
-                fz_purge_glyph_cache(p->ctx);
-                malloc_trim(0);
-            }
         }
     } fz_always(p->ctx) {
         if (pg) {
             fz_drop_page(p->ctx, pg);
             pg = nullptr;
         }
-        fz_empty_store(p->ctx);
-        fz_purge_glyph_cache(p->ctx);
+#if defined(__GLIBC__)
         malloc_trim(0);
+#endif
     } fz_catch(p->ctx) {
-        // Retain any hits found up to the error point
+        if (out_status && *out_status == SEARCH_OK) {
+            *out_status = SEARCH_ERROR;
+        }
     }
 
     *out_count = cnt;

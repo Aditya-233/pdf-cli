@@ -75,6 +75,7 @@ A lightweight, ultra-fast terminal PDF viewer written in modern **C23 (ISO/IEC 9
 ### Requirements
 - **C23 Compliant Compiler**: GCC 13+ or Clang 18+
 - **Host Terminal**: Foot, xterm, or any terminal supporting Sixel graphics
+- **System Libraries**: `libjpeg` (`libjpeg-dev`), `zlib` (`zlib1g-dev`), `libm`, `pthread`
 - Bundled C dependencies in `depends/` (MuPDF, libsixel)
 
 ### Building from Source

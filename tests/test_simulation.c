@@ -265,8 +265,52 @@ int main(int argc, char **argv) {
     SIM_CHECK(strstr(out_buf, "test_doc.pdf") != nullptr, "Batched 'i' command was dropped");
     printf(" PASSED\n");
 
-    // SIM 7: Clean shutdown on 'q'
-    printf("  [SIM 7] Verifying clean shutdown on 'q' and terminal restoration...");
+    alarm(30);
+
+    // SIM 7: Modal prompt SIGWINCH resize immunity (Audit F19)
+    printf("  [SIM 7] Testing terminal resize during prompt (KEY_RESIZE vs 'r')...");
+    fflush(stdout);
+    if (write(master, "g", 1) < 0) {}
+    drain_pty(master, out_buf, sizeof(out_buf), 400);
+    check_child_alive();
+    SIM_CHECK(strstr(out_buf, "Go to page") != nullptr, "Page prompt did not open on 'g'");
+
+    struct winsize new_ws = { .ws_row = 30, .ws_col = 100, .ws_xpixel = 900, .ws_ypixel = 540 };
+    ioctl(master, TIOCSWINSZ, &new_ws);
+    kill(child_pid, SIGWINCH);
+    usleep(50000);
+    drain_pty(master, out_buf, sizeof(out_buf), 300);
+    check_child_alive();
+    SIM_CHECK(strstr(out_buf, "Go to page (1-2): r") == nullptr, "Resize injected literal 'r' into prompt");
+
+    if (write(master, "\033", 1) < 0) {}
+    usleep(50000);
+    drain_pty(master, out_buf, sizeof(out_buf), 300);
+    printf(" PASSED\n");
+
+    // SIM 8: Legacy X10 mouse parser and coordinate isolation (Audit F17)
+    printf("  [SIM 8] Testing legacy X10 mouse sequence with coordinate 'q'...");
+    fflush(stdout);
+    // Send \033[M with btn=32 (0), col=113+32=145 ('q'+32), row=42
+    const unsigned char legacy_mouse[] = { '\033', '[', 'M', 32, 145, 42 };
+    if (write(master, legacy_mouse, sizeof(legacy_mouse)) < 0) {}
+    usleep(50000);
+    drain_pty(master, out_buf, sizeof(out_buf), 200);
+    check_child_alive();
+    printf(" PASSED\n");
+
+    // SIM 9: SS3 cursor keys handling (Audit F18)
+    printf("  [SIM 9] Testing SS3 application cursor arrows...");
+    fflush(stdout);
+    const char *ss3_keys = "\033OA\033OB\033OC\033OD";
+    if (write(master, ss3_keys, strlen(ss3_keys)) < 0) {}
+    usleep(50000);
+    drain_pty(master, out_buf, sizeof(out_buf), 200);
+    check_child_alive();
+    printf(" PASSED\n");
+
+    // SIM 10: Clean shutdown on 'q'
+    printf("  [SIM 10] Verifying clean shutdown on 'q' and terminal restoration...");
     fflush(stdout);
     if (write(master, "q", 1) < 0) {}
     drain_pty(master, out_buf, sizeof(out_buf), 1000);

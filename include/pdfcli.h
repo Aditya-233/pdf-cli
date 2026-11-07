@@ -11,11 +11,18 @@
 #define MIN_ZOOM_PCT 20
 #define MAX_ZOOM_PCT 500
 #define DEFAULT_ZOOM_PCT 100
+#define PDFCLI_STORE_BUDGET (512 * 1024)
 
 typedef enum {
     FIT_WIDTH = 0,
     FIT_PAGE = 1
 } fit_mode_t;
+
+typedef enum {
+    SEARCH_OK = 0,
+    SEARCH_TRUNCATED,
+    SEARCH_ERROR
+} search_status_t;
 
 enum {
     KEY_EOF = -1,
@@ -43,6 +50,7 @@ enum {
     KEY_CTRL_8,
     KEY_CTRL_9,
     KEY_CTRL_0,
+    KEY_RESIZE = 1200,
     KEY_CTRL_W = 23,
     KEY_CTRL_C = 3,
     KEY_ESC = 27
@@ -73,7 +81,7 @@ bool pdf_render_page_slice(pdf_doc_t *doc, int page, double scale, int sx, int s
 [[nodiscard]] fz_pixmap *pdf_render_viewport(pdf_doc_t *doc, int page, double scale, int scroll_y, int vw, int vh, bool dark);
 [[nodiscard]] toc_item_t *pdf_get_toc(pdf_doc_t *doc, size_t *out_count);
 void pdf_free_toc(toc_item_t *items, size_t count);
-[[nodiscard]] search_hit_t *pdf_search_text(pdf_doc_t *doc, const char *needle, size_t *out_count);
+[[nodiscard]] search_hit_t *pdf_search_text(pdf_doc_t *doc, const char *needle, size_t *out_count, search_status_t *out_status);
 void pdf_free_search(search_hit_t *hits);
 
 // Terminal I/O & Key Parsing (termios, foot SGR & sync)
@@ -86,6 +94,7 @@ int  term_read_key(int timeout_ms, int *mouse_col, int *mouse_row);
 
 // Sixel Graphics (Foot Terminal)
 bool sixel_draw(const fz_pixmap *pix, int col, int row);
+void sixel_free_buffers(void);
 
 // Utility functions (Terminal sanitation, UTF-8 display width, arithmetic)
 size_t sanitize_terminal_string(const char *src, char *dst, size_t dst_size);
